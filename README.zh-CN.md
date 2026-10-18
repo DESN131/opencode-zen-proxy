@@ -1,8 +1,8 @@
 <h1 align="center">OpenCode Zen 代理</h1>
 
 <p align="center">
-  让其他 OpenAI 兼容软件使用 OpenCode Zen 免费模型<br>
-  Chat Completions · Responses API · 流式输出 · 工具调用
+  让其他软件和 agent 使用 OpenCode Zen 免费模型<br>
+  Chat Completions · Responses API · Anthropic Messages · 流式输出
 </p>
 
 <p align="center">
@@ -16,7 +16,7 @@
 
 **环境要求：** Node.js 20 或更高版本，无需安装 npm 依赖。
 
-启动代理后，将其他 OpenAI 兼容软件或 agent 指向本地端点，即可使用 OpenCode Zen 免费模型。
+启动代理后，将其他 OpenAI 或 Anthropic 兼容软件、agent 指向本地端点，即可使用 OpenCode Zen 免费模型。
 
 ```powershell
 node opencode-zen-proxy.mjs
@@ -61,10 +61,31 @@ completion = client.chat.completions.create(
 print(completion.choices[0].message.content)
 ```
 
+### Anthropic Messages 示例
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://127.0.0.1:8787",
+    api_key="public",
+)
+
+message = client.messages.create(
+    model="big-pickle",
+    max_tokens=200,
+    messages=[{"role": "user", "content": "Say hello"}],
+)
+
+print(message.content)
+```
+
 ## 功能
 
-- 将 OpenCode Zen 免费模型代理给其他 OpenAI 兼容软件和 agent
+- 将 OpenCode Zen 免费模型代理给其他软件和 agent
 - OpenAI 兼容的 Chat Completions 和 Responses 端点
+- Anthropic Messages API 端点
+- 将 Responses 和 Anthropic Messages 请求翻译为 Chat Completions
 - 流式请求直接透传 SSE
 - 非流式请求自动聚合为 JSON
 - 将 Responses 请求翻译为 Chat Completions，适配只支持 Chat 协议的模型
@@ -76,7 +97,7 @@ print(completion.choices[0].message.content)
 
 ### 免费模型
 
-免费模型不需要真实 API Key。这是本代理的主要用途：让其他 OpenAI 兼容软件和 agent 通过本地代理调用 Zen 免费模型。客户端填写 `public` 或其他占位符即可。代理会自动补充上游免费层检查所需的 OpenCode 兼容请求标记。
+免费模型不需要真实 API Key。这是本代理的主要用途：让其他软件和 agent 通过本地代理调用 Zen 免费模型。客户端填写 `public` 或其他占位符即可。代理会自动补充上游免费层检查所需的 OpenCode 兼容请求标记。
 
 ### 付费模型
 
@@ -102,6 +123,7 @@ node opencode-zen-proxy.mjs
 | --- | --- |
 | `POST /v1/chat/completions` | OpenAI 兼容的 Chat Completions |
 | `POST /v1/responses` | Responses API，支持原生或翻译模式 |
+| `POST /v1/messages` | Anthropic Messages API，支持原生或翻译模式 |
 | `GET /v1/models` | 获取上游模型列表 |
 | `GET /health` | 本地代理健康检查 |
 
@@ -124,6 +146,25 @@ node opencode-zen-proxy.mjs
 - `tool_choice`、`max_output_tokens`、`reasoning.effort`
 - 文本、推理内容、工具调用、usage 以及双向流式事件
 
+## Anthropic API 模式
+
+通过 `OPENCODE_PROXY_ANTHROPIC_MODE` 控制 `/v1/messages` 的行为：
+
+| 值 | 行为 |
+| --- | --- |
+| `auto`（默认） | 免费模型使用 Chat Completions 翻译；其他模型先尝试原生 Anthropic Messages，遇到 `ModelProtocolUnsupported` 时自动回退 |
+| `chat` | 始终将 Anthropic Messages 请求翻译为 Chat Completions |
+| `native` | 始终使用原生 Anthropic Messages 端点 |
+
+翻译范围包括：
+
+- `system` 提示词和文本内容块
+- 图片内容块
+- `tool_use` 和 `tool_result` 内容块
+- Anthropic 工具定义和 `tool_choice`
+- `max_tokens`、`temperature`、`top_p`、`stop_sequences`
+- 文本、thinking、工具调用、usage 以及双向流式事件
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -137,11 +178,13 @@ node opencode-zen-proxy.mjs
 | `OPENCODE_PROXY_AUTH` | `public` | 上游 Bearer Token |
 | `OPENCODE_PROXY_PASSTHROUGH_AUTH` | 未设置 | 设为 `1` 时透传客户端的 Authorization |
 | `OPENCODE_PROXY_RESPONSES_MODE` | `auto` | `auto`、`chat` 或 `native` |
+| `OPENCODE_PROXY_ANTHROPIC_MODE` | `auto` | `auto`、`chat` 或 `native` |
 
 ## 限制
 
-- 目前只实现 Chat Completions 和 Responses。不支持 Anthropic `/messages`、Google `generateContent`、embeddings、图片和音频端点。
+- 目前只实现 Chat Completions、Responses 和 Anthropic Messages。不支持 Google `generateContent`、embeddings、图片和音频端点。
 - Responses 翻译不支持 `previous_response_id`、后台任务、`web_search`/`file_search` 等托管工具，以及文件输入。
+- Anthropic 翻译会生成合成的 thinking 签名。文档、引用以及 Anthropic 提供商特有的扩展不会被翻译。
 - 上游免费层检查属于启发式客户端指纹，可能随时变化。
 - 代理会注入一个名为 `read` 的工具标记。调用方没有提供工具时，会设置 `tool_choice: "none"`，避免模型选择这个注入工具。
 - 默认只监听 `127.0.0.1`。不要在未增加认证的情况下公开监听。

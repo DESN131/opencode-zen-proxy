@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * OpenAI-compatible local proxy for OpenCode Zen models.
+ * OpenAI- and Anthropic-compatible local proxy for OpenCode Zen models.
  *
- * Start it from this directory, then point your OpenAI client at
+ * Start it from this directory, then point your OpenAI or Anthropic client at
  * http://127.0.0.1:8787/v1:
  *
  *   node opencode-zen-proxy.mjs
@@ -11,8 +11,8 @@
  * OpenCode-shaped User-Agent, a valid `ses_...` session, a streaming request,
  * and a function tool named `read`. This proxy adds those compatibility
  * markers. It passes SSE through for streaming clients and aggregates SSE into
- * a normal response for non-streaming clients. `/v1/responses` is supported
- * with the Responses API wire format.
+ * a normal response for non-streaming clients. `/v1/responses` and
+ * `/v1/messages` are supported with their native wire formats.
  *
  * Environment:
  *   PORT                         listen port (default 8787)
@@ -25,6 +25,8 @@
  *   OPENCODE_PROXY_PASSTHROUGH_AUTH
  *                                forward the caller's Authorization when set to `1`
  *   OPENCODE_PROXY_RESPONSES_MODE
+ *                                `auto` (default), `chat`, or `native`
+ *   OPENCODE_PROXY_ANTHROPIC_MODE
  *                                `auto` (default), `chat`, or `native`
  */
 
@@ -41,6 +43,7 @@ const PROJECT = process.env.OPENCODE_PROXY_PROJECT ?? randomBytes(16).toString("
 const AUTH = process.env.OPENCODE_PROXY_AUTH
 const PASSTHROUGH_AUTH = process.env.OPENCODE_PROXY_PASSTHROUGH_AUTH === "1"
 const RESPONSES_MODE = process.env.OPENCODE_PROXY_RESPONSES_MODE ?? "auto"
+const ANTHROPIC_MODE = process.env.OPENCODE_PROXY_ANTHROPIC_MODE ?? "auto"
 const MAX_BODY_BYTES = 64 * 1024 * 1024
 
 // The free-tier gate checks for a tool named `read`. This minimal definition is
@@ -120,9 +123,17 @@ async function handle(request, response) {
     return
   }
 
+  if (request.method === "POST" && url.pathname.endsWith("/messages")) {
+    await proxyAnthropic(request, response)
+    return
+  }
+
   if (request.method !== "POST" || !url.pathname.endsWith("/chat/completions")) {
     json(response, 404, {
-      error: { type: "not_found", message: "Use /v1/chat/completions, /v1/responses or /v1/models" },
+      error: {
+        type: "not_found",
+        message: "Use /v1/chat/completions, /v1/responses, /v1/messages or /v1/models",
+      },
     })
     return
   }
@@ -351,6 +362,143 @@ async function proxyResponsesViaChat(request, response, input) {
   json(response, 200, chatToResponse(await aggregate(upstream), input.model))
 }
 
+async function proxyAnthropic(request, response) {
+  const raw = await readBody(request)
+  const input = parseBody(raw)
+  if (!input) {
+    json(response, 400, { error: { type: "invalid_request", message: "Request body must be a JSON object" } })
+    return
+  }
+
+  if (anthropicMode(input.model) === "chat") {
+    await proxyAnthropicViaChat(request, response, input)
+    return
+  }
+
+  const result = await proxyNativeAnthropic(request, response, input)
+  if (result === "fallback") await proxyAnthropicViaChat(request, response, input)
+}
+
+async function proxyNativeAnthropic(request, response, input) {
+  const wantsStream = input.stream === true
+  const controller = new AbortController()
+  response.on("close", () => controller.abort())
+
+  const upstream = await fetch(`${UPSTREAM}/messages`, {
+    method: "POST",
+    headers: buildAnthropicHeaders(request.headers, wantsStream),
+    body: JSON.stringify(input),
+    signal: controller.signal,
+  }).catch((error) => ({ error }))
+
+  if ("error" in upstream) {
+    if (upstream.error?.name === "AbortError") {
+      response.end()
+      return
+    }
+    json(response, 502, proxyError(upstream.error))
+    return
+  }
+
+  console.log(`[zen-proxy] ${upstream.status} messages model=${input.model ?? "unknown"} stream=${wantsStream}`)
+  if (!upstream.ok) {
+    const text = await upstream.text()
+    if (ANTHROPIC_MODE === "auto" && upstream.status === 400 && isModelProtocolUnsupported(text)) {
+      console.log("[zen-proxy] native messages unsupported; falling back to chat completions")
+      return "fallback"
+    }
+    response.writeHead(upstream.status, {
+      "content-type": upstream.headers.get("content-type") ?? "application/json",
+      "cache-control": "no-store",
+    })
+    response.end(text)
+    return "done"
+  }
+
+  const contentType = upstream.headers.get("content-type") ?? ""
+  if (wantsStream) {
+    response.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    })
+    await pipeBody(upstream, response)
+    return "done"
+  }
+
+  const text = await upstream.text()
+  response.writeHead(200, {
+    "content-type": contentType || "application/json",
+    "cache-control": "no-store",
+  })
+  response.end(text)
+  return "done"
+}
+
+async function proxyAnthropicViaChat(request, response, input) {
+  const wantsStream = input.stream === true
+  const body = rewriteBody(anthropicToChat(input), wantsStream)
+  const controller = new AbortController()
+  response.on("close", () => controller.abort())
+
+  const upstream = await fetch(`${UPSTREAM}/chat/completions`, {
+    method: "POST",
+    headers: buildHeaders(request.headers, wantsStream),
+    body: JSON.stringify(body),
+    signal: controller.signal,
+  }).catch((error) => ({ error }))
+
+  if ("error" in upstream) {
+    if (upstream.error?.name === "AbortError") {
+      response.end()
+      return
+    }
+    json(response, 502, proxyError(upstream.error))
+    return
+  }
+
+  console.log(
+    `[zen-proxy] ${upstream.status} anthropic->chat model=${input.model ?? "unknown"} stream=${wantsStream}`,
+  )
+  if (!upstream.ok) {
+    const text = await upstream.text()
+    response.writeHead(upstream.status, {
+      "content-type": upstream.headers.get("content-type") ?? "application/json",
+      "cache-control": "no-store",
+    })
+    response.end(text)
+    return
+  }
+
+  const contentType = upstream.headers.get("content-type") ?? ""
+  if (wantsStream) {
+    response.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    })
+    await translateChatToAnthropicStream(upstream, response, input.model)
+    return
+  }
+
+  if (!contentType.toLowerCase().includes("text/event-stream")) {
+    const text = await upstream.text()
+    const chat = parseBody(text)
+    if (chat) {
+      json(response, 200, chatToAnthropic(chat, input.model))
+      return
+    }
+    response.writeHead(200, {
+      "content-type": contentType || "application/json",
+      "cache-control": "no-store",
+    })
+    response.end(text)
+    return
+  }
+
+  json(response, 200, chatToAnthropic(await aggregate(upstream), input.model))
+}
+
 function rewriteBody(input, wantsStream) {
   const body = { ...input, stream: true }
   const tools = Array.isArray(input.tools) ? [...input.tools] : []
@@ -487,6 +635,132 @@ function responsesToolChoice(choice) {
   return "auto"
 }
 
+function anthropicToChat(input) {
+  const messages = []
+  const system = anthropicText(input.system)
+  if (system) messages.push({ role: "system", content: system })
+
+  for (const message of Array.isArray(input.messages) ? input.messages : []) {
+    if (!message || typeof message !== "object") continue
+    if (message.role === "assistant") {
+      const text = []
+      const toolCalls = []
+      for (const block of anthropicBlocks(message.content)) {
+        if (block.type === "text" && typeof block.text === "string") text.push(block.text)
+        if (block.type === "tool_use") {
+          toolCalls.push({
+            id: block.id ?? `call_${randomBytes(12).toString("hex")}`,
+            type: "function",
+            function: {
+              name: block.name ?? "",
+              arguments: typeof block.input === "string" ? block.input : JSON.stringify(block.input ?? {}),
+            },
+          })
+        }
+      }
+      if (toolCalls.length > 0) {
+        messages.push({ role: "assistant", content: text.join("") || null, tool_calls: toolCalls })
+      } else if (text.length > 0) {
+        messages.push({ role: "assistant", content: text.join("") })
+      }
+      continue
+    }
+
+    const parts = []
+    const flush = () => {
+      if (parts.length === 0) return
+      messages.push({ role: "user", content: collapseChatContent(parts) })
+      parts.length = 0
+    }
+    for (const block of anthropicBlocks(message.content)) {
+      if (block.type === "tool_result") {
+        flush()
+        messages.push({
+          role: "tool",
+          tool_call_id: block.tool_use_id ?? "",
+          content: anthropicText(block.content),
+        })
+        continue
+      }
+      if (block.type === "text" && typeof block.text === "string") {
+        parts.push({ type: "text", text: block.text })
+        continue
+      }
+      if (block.type === "image") {
+        const image = anthropicImageToChat(block)
+        if (image) parts.push(image)
+      }
+    }
+    flush()
+  }
+
+  const body = { model: input.model, messages, stream: true }
+  if (Array.isArray(input.tools) && input.tools.length > 0) {
+    body.tools = input.tools.map((tool) => ({
+      type: "function",
+      function: {
+        name: tool.name,
+        description: tool.description ?? "",
+        parameters: tool.input_schema ?? { type: "object", properties: {} },
+      },
+    }))
+  }
+  if (input.tool_choice !== undefined) body.tool_choice = anthropicToolChoice(input.tool_choice)
+  if (input.tool_choice?.disable_parallel_tool_use !== undefined) {
+    body.parallel_tool_calls = !input.tool_choice.disable_parallel_tool_use
+  }
+  if (input.max_tokens !== undefined) body.max_completion_tokens = input.max_tokens
+  for (const key of ["temperature", "top_p"]) {
+    if (input[key] !== undefined) body[key] = input[key]
+  }
+  if (Array.isArray(input.stop_sequences) && input.stop_sequences.length > 0) body.stop = input.stop_sequences
+  return body
+}
+
+function anthropicBlocks(content) {
+  if (typeof content === "string") return [{ type: "text", text: content }]
+  if (Array.isArray(content)) return content.filter((block) => block && typeof block === "object")
+  return []
+}
+
+function anthropicText(content) {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  return content
+    .flatMap((block) => {
+      if (typeof block === "string") return [block]
+      if (block?.type === "text" && typeof block.text === "string") return [block.text]
+      return []
+    })
+    .join("")
+}
+
+function anthropicImageToChat(block) {
+  const source = block.source
+  if (!source || typeof source !== "object") return undefined
+  if (source.type === "base64" && source.data && source.media_type) {
+    return { type: "image_url", image_url: { url: `data:${source.media_type};base64,${source.data}` } }
+  }
+  if (source.type === "url" && source.url) {
+    return { type: "image_url", image_url: { url: source.url } }
+  }
+  return undefined
+}
+
+function collapseChatContent(parts) {
+  if (parts.length > 0 && parts.every((part) => part.type === "text")) return parts.map((part) => part.text).join("")
+  return parts
+}
+
+function anthropicToolChoice(choice) {
+  if (typeof choice === "string") return choice
+  if (choice?.type === "auto") return "auto"
+  if (choice?.type === "any") return "required"
+  if (choice?.type === "none") return "none"
+  if (choice?.type === "tool" && choice.name) return { type: "function", function: { name: choice.name } }
+  return "auto"
+}
+
 function chatToResponse(chat, originalModel) {
   const choice = chat.choices?.[0]
   const message = choice?.message ?? {}
@@ -546,6 +820,235 @@ function chatToUsage(usage) {
     output_tokens_details: { reasoning_tokens: usage.completion_tokens_details?.reasoning_tokens ?? 0 },
     total_tokens: usage.total_tokens ?? 0,
   }
+}
+
+function chatToAnthropic(chat, originalModel) {
+  const choice = chat.choices?.[0]
+  const message = choice?.message ?? {}
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : []
+  const content = []
+
+  if (typeof message.reasoning_content === "string" && message.reasoning_content.length > 0) {
+    content.push({ type: "thinking", thinking: message.reasoning_content, signature: "" })
+  }
+  if (typeof message.content === "string" && message.content.length > 0) {
+    content.push({ type: "text", text: message.content })
+  }
+  for (const call of toolCalls) {
+    content.push({
+      type: "tool_use",
+      id: call.id ?? `toolu_${randomBytes(12).toString("hex")}`,
+      name: call.function?.name ?? "",
+      input: parseToolInput(call.function?.arguments),
+    })
+  }
+  if (content.length === 0) content.push({ type: "text", text: "" })
+
+  return {
+    id: `msg_${randomBytes(12).toString("hex")}`,
+    type: "message",
+    role: "assistant",
+    model: originalModel ?? chat.model ?? "unknown",
+    content,
+    stop_reason: anthropicStopReason(choice?.finish_reason, toolCalls.length > 0),
+    stop_sequence: null,
+    usage: anthropicUsage(chat.usage),
+  }
+}
+
+function parseToolInput(value) {
+  if (typeof value !== "string" || value.length === 0) return {}
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function anthropicUsage(usage) {
+  const result = {
+    input_tokens: usage?.prompt_tokens ?? 0,
+    output_tokens: usage?.completion_tokens ?? 0,
+  }
+  const cached = usage?.prompt_tokens_details?.cached_tokens
+  if (cached) result.cache_read_input_tokens = cached
+  return result
+}
+
+function anthropicStopReason(reason, hasToolCalls) {
+  if (hasToolCalls || reason === "tool_calls") return "tool_use"
+  if (reason === "length") return "max_tokens"
+  if (reason === "content_filter") return "refusal"
+  return "end_turn"
+}
+
+async function translateChatToAnthropicStream(upstream, response, originalModel) {
+  const reader = upstream.body.getReader()
+  const decoder = new TextDecoder()
+  const state = {
+    messageId: `msg_${randomBytes(12).toString("hex")}`,
+    model: originalModel ?? "unknown",
+    nextIndex: 0,
+    reasoning: undefined,
+    text: undefined,
+    tools: new Map(),
+    usage: undefined,
+    finishReason: undefined,
+    failed: undefined,
+  }
+  let buffer = ""
+
+  const emit = (type, data) => {
+    response.write(`event: ${type}\n`)
+    response.write(`data: ${JSON.stringify({ type, ...data })}\n\n`)
+  }
+
+  emit("message_start", {
+    message: {
+      id: state.messageId,
+      type: "message",
+      role: "assistant",
+      content: [],
+      model: state.model,
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    },
+  })
+  emit("ping", {})
+
+  const ensureReasoning = () => {
+    if (state.reasoning) return state.reasoning
+    state.reasoning = { index: state.nextIndex++, text: "" }
+    emit("content_block_start", {
+      index: state.reasoning.index,
+      content_block: { type: "thinking", thinking: "" },
+    })
+    return state.reasoning
+  }
+
+  const ensureText = () => {
+    if (state.text) return state.text
+    state.text = { index: state.nextIndex++, text: "" }
+    emit("content_block_start", {
+      index: state.text.index,
+      content_block: { type: "text", text: "" },
+    })
+    return state.text
+  }
+
+  const ensureTool = (call) => {
+    const key = call.index ?? 0
+    const existing = state.tools.get(key)
+    if (existing) return existing
+    const tool = {
+      index: state.nextIndex++,
+      id: call.id ?? `toolu_${randomBytes(12).toString("hex")}`,
+      name: call.function?.name ?? "",
+      arguments: "",
+    }
+    state.tools.set(key, tool)
+    emit("content_block_start", {
+      index: tool.index,
+      content_block: { type: "tool_use", id: tool.id, name: tool.name, input: {} },
+    })
+    return tool
+  }
+
+  const consume = (line) => {
+    if (!line.startsWith("data:")) return
+    const data = line.slice(5).trim()
+    if (!data || data === "[DONE]") return
+    const chunk = parseBody(data)
+    if (!chunk) return
+    if (chunk.error) {
+      state.failed = chunk.error
+      emit("error", { error: chunk.error })
+      return
+    }
+    if (chunk.usage) state.usage = chunk.usage
+    for (const choice of chunk.choices ?? []) {
+      if (choice.finish_reason) state.finishReason = choice.finish_reason
+      const delta = choice.delta ?? {}
+      if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+        const reasoning = ensureReasoning()
+        reasoning.text += delta.reasoning_content
+        emit("content_block_delta", {
+          index: reasoning.index,
+          delta: { type: "thinking_delta", thinking: delta.reasoning_content },
+        })
+      }
+      if (typeof delta.content === "string" && delta.content.length > 0) {
+        const text = ensureText()
+        text.text += delta.content
+        emit("content_block_delta", {
+          index: text.index,
+          delta: { type: "text_delta", text: delta.content },
+        })
+      }
+      for (const call of delta.tool_calls ?? []) {
+        const tool = ensureTool(call)
+        if (call.function?.name) tool.name = call.function.name
+        if (call.function?.arguments) {
+          tool.arguments += call.function.arguments
+          emit("content_block_delta", {
+            index: tool.index,
+            delta: { type: "input_json_delta", partial_json: call.function.arguments },
+          })
+        }
+      }
+    }
+  }
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let newline = buffer.indexOf("\n")
+    while (newline !== -1) {
+      consume(buffer.slice(0, newline).replace(/\r$/, ""))
+      buffer = buffer.slice(newline + 1)
+      newline = buffer.indexOf("\n")
+    }
+  }
+  buffer += decoder.decode()
+  if (buffer.trim()) consume(buffer.trim())
+  if (state.failed) {
+    response.end()
+    return
+  }
+
+  const blocks = []
+  if (state.reasoning) blocks.push({ index: state.reasoning.index, type: "reasoning" })
+  if (state.text) blocks.push({ index: state.text.index, type: "text" })
+  for (const tool of state.tools.values()) blocks.push({ index: tool.index, type: "tool" })
+  blocks.sort((left, right) => left.index - right.index)
+
+  if (blocks.length === 0) {
+    emit("content_block_start", { index: 0, content_block: { type: "text", text: "" } })
+    emit("content_block_stop", { index: 0 })
+  } else {
+    for (const block of blocks) {
+      if (block.type === "reasoning") {
+        emit("content_block_delta", {
+          index: block.index,
+          delta: { type: "signature_delta", signature: "" },
+        })
+      }
+      emit("content_block_stop", { index: block.index })
+    }
+  }
+
+  emit("message_delta", {
+    delta: {
+      stop_reason: anthropicStopReason(state.finishReason, state.tools.size > 0),
+      stop_sequence: null,
+    },
+    usage: { output_tokens: state.usage?.completion_tokens ?? 0 },
+  })
+  emit("message_stop", {})
+  response.end()
 }
 
 async function translateChatStream(upstream, response, originalModel) {
@@ -781,8 +1284,26 @@ function responsesMode(model) {
   return "native"
 }
 
+function anthropicMode(model) {
+  if (ANTHROPIC_MODE === "chat") return "chat"
+  if (ANTHROPIC_MODE === "native") return "native"
+  if (typeof model === "string" && (model === "big-pickle" || model.includes("-free"))) return "chat"
+  return "native"
+}
+
 function isModelProtocolUnsupported(text) {
   return text.includes("ModelProtocolUnsupported") || text.includes("does not support this protocol")
+}
+
+function buildAnthropicHeaders(incoming, wantsStream) {
+  const headers = buildHeaders(incoming, wantsStream)
+  const key = upstreamKey(incoming)
+  headers.set("authorization", `Bearer ${key}`)
+  headers.set("x-api-key", key)
+  headers.set("anthropic-version", firstHeader(incoming["anthropic-version"]) ?? "2023-06-01")
+  const beta = firstHeader(incoming["anthropic-beta"])
+  if (beta) headers.set("anthropic-beta", beta)
+  return headers
 }
 
 function buildHeaders(incoming, wantsStream) {
@@ -1035,6 +1556,15 @@ function upstreamAuthorization(value) {
   if (AUTH) return `Bearer ${AUTH.replace(/^Bearer\s+/i, "")}`
   if (PASSTHROUGH_AUTH) return firstHeader(value) ?? "Bearer public"
   return "Bearer public"
+}
+
+function upstreamKey(incoming) {
+  if (AUTH) return AUTH.replace(/^Bearer\s+/i, "")
+  if (PASSTHROUGH_AUTH) {
+    const value = firstHeader(incoming["x-api-key"]) ?? firstHeader(incoming.authorization)
+    return value ? value.replace(/^Bearer\s+/i, "") : "public"
+  }
+  return "public"
 }
 
 function createSessionID() {

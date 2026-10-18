@@ -1,8 +1,8 @@
 <h1 align="center">OpenCode Zen Proxy</h1>
 
 <p align="center">
-  Use OpenCode Zen free models from other OpenAI-compatible software<br>
-  Chat Completions · Responses API · Streaming · Tool calls
+  Use OpenCode Zen free models from other software and agents<br>
+  Chat Completions · Responses API · Anthropic Messages · Streaming
 </p>
 
 <p align="center">
@@ -16,7 +16,7 @@
 
 **Requirements:** Node.js 20 or newer. No npm dependencies.
 
-Start the proxy, then point other OpenAI-compatible software or agents at the local endpoint to use OpenCode Zen free models.
+Start the proxy, then point other OpenAI- or Anthropic-compatible software or agents at the local endpoint to use OpenCode Zen free models.
 
 ```powershell
 node opencode-zen-proxy.mjs
@@ -61,10 +61,31 @@ completion = client.chat.completions.create(
 print(completion.choices[0].message.content)
 ```
 
+### Anthropic Messages example
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://127.0.0.1:8787",
+    api_key="public",
+)
+
+message = client.messages.create(
+    model="big-pickle",
+    max_tokens=200,
+    messages=[{"role": "user", "content": "Say hello"}],
+)
+
+print(message.content)
+```
+
 ## Features
 
-- Proxy OpenCode Zen free models for other OpenAI-compatible software and agents
+- Proxy OpenCode Zen free models for other software and agents
 - OpenAI-compatible Chat Completions and Responses endpoints
+- Anthropic Messages API endpoint
+- Responses-to-Chat and Anthropic-to-Chat translation for compatible models
 - SSE passthrough for streaming clients
 - JSON aggregation for non-streaming clients
 - Responses-to-Chat translation for models that only support Chat Completions
@@ -76,7 +97,7 @@ print(completion.choices[0].message.content)
 
 ### Free models
 
-Free models do not require a real API key. This is the main use case: other OpenAI-compatible software and agents can call Zen free models through this proxy. Use `public` or another placeholder as the client API key. The proxy adds the request markers required by the upstream free-tier check.
+Free models do not require a real API key. This is the main use case: other software and agents can call Zen free models through this proxy. Use `public` or another placeholder as the client API key. The proxy adds the request markers required by the upstream free-tier check.
 
 ### Paid models
 
@@ -102,6 +123,7 @@ Paid models are billed by the upstream service. Upstream errors such as `401`, `
 | --- | --- |
 | `POST /v1/chat/completions` | OpenAI-compatible Chat Completions |
 | `POST /v1/responses` | Responses API, native or translated |
+| `POST /v1/messages` | Anthropic Messages API, native or translated |
 | `GET /v1/models` | Upstream model list |
 | `GET /health` | Local proxy health check |
 
@@ -124,6 +146,25 @@ The translation covers:
 - `tool_choice`, `max_output_tokens`, and `reasoning.effort`
 - Text, reasoning, tool calls, usage, and streaming events in both directions
 
+## Anthropic API Modes
+
+`OPENCODE_PROXY_ANTHROPIC_MODE` controls `/v1/messages`:
+
+| Value | Behavior |
+| --- | --- |
+| `auto` (default) | Free models use Chat Completions translation. Other models try native Anthropic Messages first and fall back on `ModelProtocolUnsupported`. |
+| `chat` | Always translate Anthropic Messages requests to Chat Completions. |
+| `native` | Always forward to the native Anthropic Messages endpoint. |
+
+The translation covers:
+
+- `system` prompts and text content blocks
+- Image content blocks
+- `tool_use` and `tool_result` blocks
+- Anthropic tools and `tool_choice`
+- `max_tokens`, `temperature`, `top_p`, and `stop_sequences`
+- Text, thinking, tool calls, usage, and streaming events in both directions
+
 ## Environment Variables
 
 | Variable | Default | Purpose |
@@ -137,11 +178,13 @@ The translation covers:
 | `OPENCODE_PROXY_AUTH` | `public` | Upstream bearer token |
 | `OPENCODE_PROXY_PASSTHROUGH_AUTH` | unset | Forward the client's Authorization when set to `1` |
 | `OPENCODE_PROXY_RESPONSES_MODE` | `auto` | `auto`, `chat`, or `native` |
+| `OPENCODE_PROXY_ANTHROPIC_MODE` | `auto` | `auto`, `chat`, or `native` |
 
 ## Limitations
 
-- Only Chat Completions and Responses are implemented. Anthropic `/messages`, Google `generateContent`, embeddings, images, and audio endpoints are not supported.
+- Only Chat Completions, Responses, and Anthropic Messages are implemented. Google `generateContent`, embeddings, images, and audio endpoints are not supported.
 - Responses translation does not support `previous_response_id`, background tasks, hosted tools such as `web_search` or `file_search`, or file inputs.
+- Anthropic translation emits synthetic thinking signatures. Documents, citations, and provider-specific Anthropic extensions are not translated.
 - The upstream free-tier check is a heuristic client fingerprint and may change without notice.
 - The proxy injects a `read` tool marker. When the caller provides no tools, `tool_choice` is set to `none` to prevent the injected tool from being selected.
 - The server binds to `127.0.0.1` by default. Do not expose it publicly without authentication.

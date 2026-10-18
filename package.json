@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "OpenAI-compatible proxy for using OpenCode Zen free models from other software, including Responses API translation.",
+  "description": "OpenAI- and Anthropic-compatible proxy for using OpenCode Zen free models from other software.",
   "scripts": {
     "check": "node --check opencode-zen-proxy.mjs"
   },
