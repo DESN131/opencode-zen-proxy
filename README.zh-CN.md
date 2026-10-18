@@ -19,6 +19,12 @@
 启动代理后，将其他 OpenAI 或 Anthropic 兼容软件、agent 指向本地端点，即可使用 OpenCode Zen 免费模型。
 
 ```powershell
+npm start
+```
+
+或者直接运行脚本：
+
+```powershell
 node opencode-zen-proxy.mjs
 ```
 

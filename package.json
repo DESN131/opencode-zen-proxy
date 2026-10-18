@@ -5,6 +5,7 @@
   "type": "module",
   "description": "OpenAI- and Anthropic-compatible proxy for using OpenCode Zen free models from other software.",
   "scripts": {
+    "start": "node opencode-zen-proxy.mjs",
     "check": "node --check opencode-zen-proxy.mjs"
   },
   "engines": {

@@ -19,6 +19,12 @@
 Start the proxy, then point other OpenAI- or Anthropic-compatible software or agents at the local endpoint to use OpenCode Zen free models.
 
 ```powershell
+npm start
+```
+
+Or run the script directly:
+
+```powershell
 node opencode-zen-proxy.mjs
 ```
 
