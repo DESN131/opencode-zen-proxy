@@ -500,7 +500,19 @@ async function proxyAnthropicViaChat(request, response, input) {
 }
 
 function rewriteBody(input, wantsStream) {
-  const body = { ...input, stream: true }
+  const messages = Array.isArray(input.messages) ? input.messages.map(normalizeChatMessage) : input.messages
+  const hasReasoning =
+    (Array.isArray(messages) &&
+      messages.some((message) => message?.role === "assistant" && typeof message.reasoning_content === "string")) ||
+    knownReasoningModel(input.model)
+  const normalized = hasReasoning
+    ? messages.map((message) =>
+        message?.role === "assistant" && message.reasoning_content === undefined
+          ? { ...message, reasoning_content: "" }
+          : message,
+      )
+    : messages
+  const body = { ...input, messages: normalized, stream: true }
   const tools = Array.isArray(input.tools) ? [...input.tools] : []
   const hasRead = tools.some((tool) => tool?.type === "function" && tool?.function?.name === "read")
   if (!hasRead) tools.push(READ_TOOL)
@@ -513,6 +525,23 @@ function rewriteBody(input, wantsStream) {
     if (body.tool_choice === undefined) body.tool_choice = "none"
   }
   return body
+}
+
+function normalizeChatMessage(message) {
+  if (!message || message.role !== "assistant") return message
+  if (typeof message.reasoning_content === "string") return message
+  if (typeof message.reasoning === "string") return { ...message, reasoning_content: message.reasoning }
+  if (typeof message.reasoning_text === "string") return { ...message, reasoning_content: message.reasoning_text }
+  return message
+}
+
+function knownReasoningModel(model) {
+  return (
+    typeof model === "string" &&
+    /(big-pickle|deepseek|kimi|glm|minimax|mimo|nemotron|longcat|ring-|space-bunny|hy3|step-|north-|x-preview|qwen)/i.test(
+      model,
+    )
+  )
 }
 
 function rewriteResponsesBody(input) {
@@ -530,6 +559,31 @@ function rewriteResponsesBody(input) {
 
 function responsesToChat(input) {
   const messages = []
+  let pendingReasoning = ""
+  let hasPendingReasoning = false
+
+  const attachReasoning = (message) => {
+    if (!hasPendingReasoning) return
+    message.reasoning_content = (message.reasoning_content ?? "") + pendingReasoning
+    pendingReasoning = ""
+    hasPendingReasoning = false
+  }
+  const flushReasoning = () => {
+    if (!hasPendingReasoning) return
+    messages.push({ role: "assistant", content: "", reasoning_content: pendingReasoning })
+    pendingReasoning = ""
+    hasPendingReasoning = false
+  }
+  const addReasoning = (text) => {
+    const previous = messages[messages.length - 1]
+    if (previous?.role === "assistant") {
+      previous.reasoning_content = (previous.reasoning_content ?? "") + text
+      return
+    }
+    pendingReasoning += text
+    hasPendingReasoning = true
+  }
+
   if (typeof input.instructions === "string" && input.instructions.trim())
     messages.push({ role: "system", content: input.instructions })
 
@@ -538,15 +592,29 @@ function responsesToChat(input) {
   } else if (Array.isArray(input.input)) {
     for (const item of input.input) {
       if (typeof item === "string") {
+        flushReasoning()
         messages.push({ role: "user", content: item })
         continue
       }
       if (!item || typeof item !== "object") continue
+      if (item.type === "reasoning") {
+        const text = responsesReasoningText(item)
+        addReasoning(text)
+        if (text.length === 0) hasPendingReasoning = true
+        continue
+      }
       if (item.type === "message") {
-        messages.push({
-          role: item.role === "developer" ? "system" : (item.role ?? "user"),
-          content: responsesContent(item.content),
-        })
+        if (item.role === "assistant") {
+          const assistant = { role: "assistant", content: responsesContent(item.content) }
+          attachReasoning(assistant)
+          messages.push(assistant)
+        } else {
+          flushReasoning()
+          messages.push({
+            role: item.role === "developer" ? "system" : (item.role ?? "user"),
+            content: responsesContent(item.content),
+          })
+        }
         continue
       }
       if (item.type === "function_call") {
@@ -556,11 +624,18 @@ function responsesToChat(input) {
           function: { name: item.name ?? "", arguments: item.arguments ?? "{}" },
         }
         const previous = messages[messages.length - 1]
-        if (previous?.role === "assistant" && Array.isArray(previous.tool_calls)) previous.tool_calls.push(call)
-        else messages.push({ role: "assistant", content: null, tool_calls: [call] })
+        if (previous?.role === "assistant" && Array.isArray(previous.tool_calls)) {
+          previous.tool_calls.push(call)
+          attachReasoning(previous)
+        } else {
+          const assistant = { role: "assistant", content: null, tool_calls: [call] }
+          attachReasoning(assistant)
+          messages.push(assistant)
+        }
         continue
       }
       if (item.type === "function_call_output") {
+        flushReasoning()
         messages.push({
           role: "tool",
           tool_call_id: item.call_id ?? "",
@@ -568,6 +643,7 @@ function responsesToChat(input) {
         })
       }
     }
+    flushReasoning()
   }
 
   const body = { model: input.model, messages, stream: true }
@@ -604,6 +680,21 @@ function responsesToChat(input) {
   }
   if (input.reasoning?.effort !== undefined) body.reasoning_effort = input.reasoning.effort
   return body
+}
+
+function responsesReasoningText(item) {
+  const content = []
+  for (const part of Array.isArray(item.content) ? item.content : []) {
+    if (part?.type === "reasoning_text" && typeof part.text === "string") content.push(part.text)
+  }
+  if (content.length > 0) return content.join("")
+
+  const summary = []
+  for (const part of Array.isArray(item.summary) ? item.summary : []) {
+    if (part?.type === "summary_text" && typeof part.text === "string") summary.push(part.text)
+  }
+  if (summary.length > 0) return summary.join("")
+  return typeof item.text === "string" ? item.text : ""
 }
 
 function responsesContent(content) {
@@ -644,9 +735,16 @@ function anthropicToChat(input) {
     if (!message || typeof message !== "object") continue
     if (message.role === "assistant") {
       const text = []
+      const reasoning = []
       const toolCalls = []
+      let hasThinking = false
       for (const block of anthropicBlocks(message.content)) {
         if (block.type === "text" && typeof block.text === "string") text.push(block.text)
+        if (block.type === "thinking") {
+          hasThinking = true
+          if (typeof block.thinking === "string") reasoning.push(block.thinking)
+        }
+        if (block.type === "redacted_thinking") hasThinking = true
         if (block.type === "tool_use") {
           toolCalls.push({
             id: block.id ?? `call_${randomBytes(12).toString("hex")}`,
@@ -658,11 +756,14 @@ function anthropicToChat(input) {
           })
         }
       }
-      if (toolCalls.length > 0) {
-        messages.push({ role: "assistant", content: text.join("") || null, tool_calls: toolCalls })
-      } else if (text.length > 0) {
-        messages.push({ role: "assistant", content: text.join("") })
+      if (toolCalls.length === 0 && text.length === 0 && !hasThinking) continue
+      const assistant = {
+        role: "assistant",
+        content: text.join("") || (toolCalls.length > 0 ? null : ""),
       }
+      if (toolCalls.length > 0) assistant.tool_calls = toolCalls
+      if (hasThinking) assistant.reasoning_content = reasoning.join("")
+      messages.push(assistant)
       continue
     }
 

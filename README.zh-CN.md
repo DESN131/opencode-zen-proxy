@@ -92,6 +92,7 @@ print(message.content)
 - OpenAI 兼容的 Chat Completions 和 Responses 端点
 - Anthropic Messages API 端点
 - 将 Responses 和 Anthropic Messages 请求翻译为 Chat Completions
+- 多轮对话会将 thinking 和 reasoning 内容回填为 `reasoning_content`
 - 流式请求直接透传 SSE
 - 非流式请求自动聚合为 JSON
 - 将 Responses 请求翻译为 Chat Completions，适配只支持 Chat 协议的模型
@@ -151,6 +152,7 @@ node opencode-zen-proxy.mjs
 - Responses 工具定义转为 Chat Completions 工具定义
 - `tool_choice`、`max_output_tokens`、`reasoning.effort`
 - 文本、推理内容、工具调用、usage 以及双向流式事件
+- 后续 assistant 轮次会将 reasoning 项回填为 `reasoning_content`
 
 ## Anthropic API 模式
 
@@ -170,6 +172,7 @@ node opencode-zen-proxy.mjs
 - Anthropic 工具定义和 `tool_choice`
 - `max_tokens`、`temperature`、`top_p`、`stop_sequences`
 - 文本、thinking、工具调用、usage 以及双向流式事件
+- 后续 assistant 轮次会将 thinking 块回填为 `reasoning_content`
 
 ## 环境变量
 

@@ -92,6 +92,7 @@ print(message.content)
 - OpenAI-compatible Chat Completions and Responses endpoints
 - Anthropic Messages API endpoint
 - Responses-to-Chat and Anthropic-to-Chat translation for compatible models
+- Replays thinking and reasoning content as `reasoning_content` for multi-turn thinking models
 - SSE passthrough for streaming clients
 - JSON aggregation for non-streaming clients
 - Responses-to-Chat translation for models that only support Chat Completions
@@ -151,6 +152,7 @@ The translation covers:
 - Responses tools to Chat Completions tools
 - `tool_choice`, `max_output_tokens`, and `reasoning.effort`
 - Text, reasoning, tool calls, usage, and streaming events in both directions
+- Reasoning items are replayed as `reasoning_content` on subsequent assistant turns
 
 ## Anthropic API Modes
 
@@ -170,6 +172,7 @@ The translation covers:
 - Anthropic tools and `tool_choice`
 - `max_tokens`, `temperature`, `top_p`, and `stop_sequences`
 - Text, thinking, tool calls, usage, and streaming events in both directions
+- Thinking blocks are replayed as `reasoning_content` on subsequent assistant turns
 
 ## Environment Variables
 
