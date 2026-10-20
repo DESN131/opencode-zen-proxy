@@ -35,7 +35,10 @@ import { createHash, randomBytes } from "node:crypto"
 import { gunzipSync, gzipSync } from "node:zlib"
 
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-const PORT = Number(process.env.PORT ?? 8787)
+const CONFIGURED_PORT = Number(process.env.PORT ?? 8787)
+const PORT = Number.isInteger(CONFIGURED_PORT) && CONFIGURED_PORT >= 0 ? CONFIGURED_PORT : 8787
+const CONFIGURED_ATTEMPTS = Number(process.env.PORT_ATTEMPTS ?? 20)
+const PORT_ATTEMPTS = Number.isFinite(CONFIGURED_ATTEMPTS) ? Math.max(1, Math.floor(CONFIGURED_ATTEMPTS)) : 20
 const HOST = process.env.HOST ?? "127.0.0.1"
 const UPSTREAM = (process.env.OPENCODE_ZEN_BASE_URL ?? "https://opencode.ai/zen/v1").replace(/\/+$/, "")
 const USER_AGENT = process.env.OPENCODE_PROXY_UA ?? "opencode/latest/2.0.32/cli"
@@ -48,6 +51,119 @@ const ANTHROPIC_MODE = process.env.OPENCODE_PROXY_ANTHROPIC_MODE ?? "auto"
 const MAX_BODY_BYTES = 64 * 1024 * 1024
 const REASONING_PREFIX = "zen1:"
 const FIXED_SESSION = process.env.OPENCODE_PROXY_SESSION
+
+const LOG_TIME_ZONE = process.env.LOG_TIME_ZONE ?? "Asia/Hong_Kong"
+const LOG_TIME_FORMAT = new Intl.DateTimeFormat("sv-SE", {
+  timeZone: LOG_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  fractionalSecondDigits: 3,
+  hour12: false,
+})
+
+function logTimestamp() {
+  return LOG_TIME_FORMAT.format(new Date()).replace(",", ".")
+}
+
+function logLine(level, message) {
+  const line = `[${logTimestamp()}] [zen-proxy] ${message}`
+  if (level === "error") console.error(line)
+  else if (level === "warn") console.warn(line)
+  else console.log(line)
+}
+
+function logInfo(message) {
+  logLine("log", message)
+}
+
+function logWarn(message) {
+  logLine("warn", message)
+}
+
+function logError(message) {
+  logLine("error", message)
+}
+
+function createRequestStats(protocol, model, stream) {
+  return {
+    protocol,
+    model: String(model ?? "unknown"),
+    stream,
+    startedAt: Date.now(),
+    firstOutputAt: null,
+    lastOutputAt: null,
+    status: null,
+    usage: null,
+    error: null,
+  }
+}
+
+function markOutput(stats) {
+  if (!stats) return
+  const now = Date.now()
+  if (stats.firstOutputAt === null) stats.firstOutputAt = now
+  stats.lastOutputAt = now
+}
+
+function usageSnapshot(usage) {
+  if (!usage) return undefined
+  const input = usage.inputTokens ?? usage.prompt_tokens ?? usage.input_tokens ?? 0
+  const output = usage.outputTokens ?? usage.completion_tokens ?? usage.output_tokens ?? 0
+  return {
+    input,
+    output,
+    total: usage.totalTokens ?? usage.total_tokens ?? input + output,
+    cached:
+      usage.inputTokenDetails?.cacheReadTokens ??
+      usage.prompt_tokens_details?.cached_tokens ??
+      usage.input_tokens_details?.cached_tokens ??
+      usage.cache_read_input_tokens ??
+      0,
+    reasoning:
+      usage.outputTokenDetails?.reasoningTokens ??
+      usage.completion_tokens_details?.reasoning_tokens ??
+      usage.output_tokens_details?.reasoning_tokens ??
+      0,
+  }
+}
+
+function formatDuration(ms) {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${Math.round(ms)}ms`
+}
+
+function logRequest(stats) {
+  const elapsedMs = Math.max(0, Date.now() - stats.startedAt)
+  const usage = usageSnapshot(stats.usage)
+  const tokens = usage
+    ? `tokens=${usage.input}/${usage.output}/${usage.total} cached=${usage.cached} reasoning=${usage.reasoning}`
+    : "tokens=unknown"
+  const ttftMs = stats.firstOutputAt === null ? null : Math.max(0, stats.firstOutputAt - stats.startedAt)
+  const generationMs =
+    stats.firstOutputAt === null || stats.lastOutputAt === null
+      ? null
+      : Math.max(0, stats.lastOutputAt - stats.firstOutputAt)
+  // Token speed uses the observed generation window; total latency includes queueing and TTFT.
+  const speedWindowMs = generationMs !== null && generationMs > 0 ? generationMs : elapsedMs
+  const speed = usage && usage.output > 0 && speedWindowMs > 0
+    ? (usage.output / (speedWindowMs / 1000)).toFixed(1)
+    : "0.0"
+  const ttft = ttftMs === null ? "" : ` ttft=${formatDuration(ttftMs)}`
+  const generation = generationMs !== null && generationMs > 0 ? ` gen=${formatDuration(generationMs)}` : ""
+  const status = stats.status ? `${stats.status} ` : ""
+  const errorText =
+    stats.error && typeof stats.error === "object"
+      ? (stats.error.message ?? JSON.stringify(stats.error))
+      : stats.error
+  const error = errorText ? ` error=${String(errorText).slice(0, 200)}` : ""
+  logLine(
+    stats.error ? "error" : "log",
+    `${status}${stats.protocol} model=${stats.model} stream=${stats.stream} ${tokens} elapsed=${formatDuration(elapsedMs)}${ttft}${generation} speed=${speed}tok/s${error}`,
+  )
+}
 
 // The free-tier gate checks for a tool named `read`. This minimal definition is
 // enough; tools already supplied by the caller are preserved.
@@ -87,10 +203,10 @@ const RESPONSES_READ_TOOL = {
   },
 }
 
-const server = http.createServer((request, response) => {
+function handleRequest(request, response) {
   handle(request, response).catch((error) => {
     if (error?.name === "AbortError" || (error instanceof Error && error.message.includes("aborted"))) return
-    console.error(`[zen-proxy] ${error instanceof Error ? error.message : String(error)}`)
+    logError(error instanceof Error ? error.message : String(error))
     const status = typeof error?.status === "number" ? error.status : 500
     if (!response.headersSent) {
       const target = String(request.url ?? "")
@@ -102,14 +218,41 @@ const server = http.createServer((request, response) => {
     }
     response.end()
   })
-})
+}
 
-server.listen(PORT, HOST, () => {
-  console.log(`[zen-proxy] listening on http://${HOST}:${PORT}/v1`)
-  console.log(`[zen-proxy] upstream ${UPSTREAM}`)
-  console.log(`[zen-proxy] session ${SESSION}`)
-  console.log(`[zen-proxy] project ${PROJECT}`)
-})
+startServer()
+
+function startServer(attempt = 0) {
+  const port = PORT === 0 ? 0 : PORT + attempt
+  const server = http.createServer(handleRequest)
+  const onListenError = (error) => {
+    const canRetry =
+      error?.code === "EADDRINUSE" &&
+      PORT !== 0 &&
+      attempt + 1 < PORT_ATTEMPTS &&
+      PORT + attempt + 1 <= 65535
+    if (canRetry) {
+      logWarn(`port ${port} is in use, trying ${PORT + attempt + 1}`)
+      setImmediate(() => startServer(attempt + 1))
+      return
+    }
+    logError(`failed to listen on ${HOST}:${port}: ${error instanceof Error ? error.message : String(error)}`)
+    process.exitCode = 1
+  }
+  server.once("error", onListenError)
+  server.listen(port, HOST, () => {
+    server.off("error", onListenError)
+    server.on("error", (error) => {
+      logError(`server error: ${error instanceof Error ? error.message : String(error)}`)
+    })
+    const address = server.address()
+    const actualPort = typeof address === "object" && address ? address.port : port
+    logInfo(`listening on http://${HOST}:${actualPort}/v1`)
+    logInfo(`upstream ${UPSTREAM}`)
+    logInfo(`session ${SESSION}`)
+    logInfo(`project ${PROJECT}`)
+  })
+}
 
 async function handle(request, response) {
   setCors(response)
@@ -190,6 +333,7 @@ async function proxyChat(request, response) {
   const rewritten = rewriteBody(input, wantsStream)
   const body = rewritten.body
   const session = requestSession(request.headers, input)
+  const stats = createRequestStats("chat", input.model, wantsStream)
   const controller = new AbortController()
   response.on("close", () => controller.abort())
 
@@ -202,17 +346,24 @@ async function proxyChat(request, response) {
 
   if ("error" in upstream) {
     if (upstream.error?.name === "AbortError") {
+      stats.error = "aborted"
+      logRequest(stats)
       response.end()
       return
     }
+    stats.error = upstream.error instanceof Error ? upstream.error.message : String(upstream.error)
+    logRequest(stats)
     json(response, 502, proxyError(upstream.error))
     return
   }
 
-  console.log(`[zen-proxy] ${upstream.status} model=${input.model ?? "unknown"} stream=${wantsStream}`)
+  stats.status = upstream.status
   if (!upstream.ok) {
     const text = await upstream.text()
-    json(response, upstream.status, openAIUpstreamError(text))
+    const error = readUpstreamError(text)
+    stats.error = error.message
+    logRequest(stats)
+    json(response, upstream.status, { error })
     return
   }
 
@@ -223,7 +374,10 @@ async function proxyChat(request, response) {
       "cache-control": "no-cache",
       connection: "keep-alive",
     })
-    await pipeChatStream(upstream, response, rewritten.injectedRead)
+    const result = await pipeChatStream(upstream, response, rewritten.injectedRead, stats)
+    stats.usage = result?.usage
+    stats.error = result?.error
+    logRequest(stats)
     return
   }
 
@@ -232,7 +386,10 @@ async function proxyChat(request, response) {
     const chat = parseBody(text)
     if (chat) {
       if (chat.error) {
-        json(response, 502, openAIUpstreamError(text))
+        const error = readUpstreamError(text)
+        stats.error = error.message
+        logRequest(stats)
+        json(response, 502, { error })
         return
       }
       for (const choice of chat.choices ?? []) {
@@ -246,9 +403,13 @@ async function proxyChat(request, response) {
           message.tool_calls = message.tool_calls.filter((call) => call.function?.name !== "read")
         }
       }
+      stats.usage = chat.usage
+      logRequest(stats)
       json(response, 200, chat)
       return
     }
+    stats.error = "Upstream returned a non-JSON response"
+    logRequest(stats)
     response.writeHead(200, {
       "content-type": contentType || "application/json",
       "cache-control": "no-store",
@@ -257,7 +418,16 @@ async function proxyChat(request, response) {
     return
   }
 
-  json(response, 200, await aggregate(upstream, rewritten.injectedRead))
+  try {
+    const chat = await aggregate(upstream, rewritten.injectedRead, stats)
+    stats.usage = chat.usage
+    logRequest(stats)
+    json(response, 200, chat)
+  } catch (error) {
+    stats.error = error instanceof Error ? error.message : String(error)
+    logRequest(stats)
+    throw error
+  }
 }
 
 async function proxyResponses(request, response) {
@@ -289,6 +459,7 @@ async function proxyNativeResponses(request, response, input) {
   const wantsStream = input.stream === true
   const body = rewriteResponsesBody(input)
   const session = requestSession(request.headers, input)
+  const stats = createRequestStats("responses-native", input.model, wantsStream)
   const controller = new AbortController()
   response.on("close", () => controller.abort())
 
@@ -301,21 +472,29 @@ async function proxyNativeResponses(request, response, input) {
 
   if ("error" in upstream) {
     if (upstream.error?.name === "AbortError") {
+      stats.error = "aborted"
+      logRequest(stats)
       response.end()
       return
     }
+    stats.error = upstream.error instanceof Error ? upstream.error.message : String(upstream.error)
+    logRequest(stats)
     json(response, 502, proxyError(upstream.error))
     return
   }
 
-  console.log(`[zen-proxy] ${upstream.status} responses model=${input.model ?? "unknown"} stream=${wantsStream}`)
+  stats.status = upstream.status
   if (!upstream.ok) {
     const text = await upstream.text()
     if (RESPONSES_MODE === "auto" && upstream.status === 400 && isModelProtocolUnsupported(text)) {
-      console.log("[zen-proxy] native responses unsupported; falling back to chat completions")
+      stats.error = "native responses unsupported; falling back"
+      logRequest(stats)
       return "fallback"
     }
-    json(response, upstream.status, openAIUpstreamError(text))
+    const error = readUpstreamError(text)
+    stats.error = error.message
+    logRequest(stats)
+    json(response, upstream.status, { error })
     return
   }
 
@@ -326,12 +505,19 @@ async function proxyNativeResponses(request, response, input) {
       "cache-control": "no-cache",
       connection: "keep-alive",
     })
-    await pipeBody(upstream, response)
+    const result = await pipeBody(upstream, response, stats)
+    stats.usage = result?.usage
+    stats.error = result?.error
+    logRequest(stats)
     return
   }
 
   if (!contentType.toLowerCase().includes("text/event-stream")) {
     const text = await upstream.text()
+    const parsed = parseBody(text)
+    stats.usage = parsed?.usage
+    if (parsed?.error) stats.error = readUpstreamError(text).message
+    logRequest(stats)
     response.writeHead(200, {
       "content-type": contentType || "application/json",
       "cache-control": "no-store",
@@ -340,8 +526,20 @@ async function proxyNativeResponses(request, response, input) {
     return
   }
 
-  json(response, 200, await aggregateResponses(upstream))
-  return "done"
+  try {
+    const result = await aggregateResponses(upstream, stats)
+    stats.usage = result.usage
+    if (result.status === "failed") {
+      stats.error = result.error?.message ?? "Upstream response failed"
+    }
+    logRequest(stats)
+    json(response, 200, result)
+    return "done"
+  } catch (error) {
+    stats.error = error instanceof Error ? error.message : String(error)
+    logRequest(stats)
+    throw error
+  }
 }
 
 async function proxyResponsesViaChat(request, response, input) {
@@ -350,6 +548,7 @@ async function proxyResponsesViaChat(request, response, input) {
   const rewritten = rewriteBody(converted.body, wantsStream)
   const body = rewritten.body
   const session = requestSession(request.headers, input)
+  const stats = createRequestStats("responses", input.model, wantsStream)
   const controller = new AbortController()
   response.on("close", () => controller.abort())
 
@@ -362,17 +561,24 @@ async function proxyResponsesViaChat(request, response, input) {
 
   if ("error" in upstream) {
     if (upstream.error?.name === "AbortError") {
+      stats.error = "aborted"
+      logRequest(stats)
       response.end()
       return
     }
+    stats.error = upstream.error instanceof Error ? upstream.error.message : String(upstream.error)
+    logRequest(stats)
     json(response, 502, proxyError(upstream.error))
     return
   }
 
-  console.log(`[zen-proxy] ${upstream.status} responses->chat model=${input.model ?? "unknown"} stream=${wantsStream}`)
+  stats.status = upstream.status
   if (!upstream.ok) {
     const text = await upstream.text()
-    json(response, upstream.status, openAIUpstreamError(text))
+    const error = readUpstreamError(text)
+    stats.error = error.message
+    logRequest(stats)
+    json(response, upstream.status, { error })
     return
   }
 
@@ -383,7 +589,17 @@ async function proxyResponsesViaChat(request, response, input) {
       "cache-control": "no-cache",
       connection: "keep-alive",
     })
-    await translateChatStream(upstream, response, input.model, converted.registry, rewritten.injectedRead)
+    const result = await translateChatStream(
+      upstream,
+      response,
+      input.model,
+      converted.registry,
+      rewritten.injectedRead,
+      stats,
+    )
+    stats.usage = result?.usage
+    stats.error = result?.error
+    logRequest(stats)
     return
   }
 
@@ -392,12 +608,20 @@ async function proxyResponsesViaChat(request, response, input) {
     const chat = parseBody(text)
     if (chat) {
       if (chat.error) {
-        json(response, 502, openAIUpstreamError(text))
+        const error = readUpstreamError(text)
+        stats.error = error.message
+        logRequest(stats)
+        json(response, 502, { error })
         return
       }
-      json(response, 200, chatToResponse(chat, input.model, converted.registry, rewritten.injectedRead))
+      const translated = chatToResponse(chat, input.model, converted.registry, rewritten.injectedRead)
+      stats.usage = translated.usage
+      logRequest(stats)
+      json(response, 200, translated)
       return
     }
+    stats.error = "Upstream returned a non-JSON response"
+    logRequest(stats)
     response.writeHead(200, {
       "content-type": contentType || "application/json",
       "cache-control": "no-store",
@@ -406,11 +630,21 @@ async function proxyResponsesViaChat(request, response, input) {
     return
   }
 
-  json(
-    response,
-    200,
-    chatToResponse(await aggregate(upstream, rewritten.injectedRead), input.model, converted.registry, rewritten.injectedRead),
-  )
+  try {
+    const translated = chatToResponse(
+      await aggregate(upstream, rewritten.injectedRead, stats),
+      input.model,
+      converted.registry,
+      rewritten.injectedRead,
+    )
+    stats.usage = translated.usage
+    logRequest(stats)
+    json(response, 200, translated)
+  } catch (error) {
+    stats.error = error instanceof Error ? error.message : String(error)
+    logRequest(stats)
+    throw error
+  }
 }
 
 async function proxyAnthropic(request, response) {
@@ -441,6 +675,7 @@ async function proxyAnthropic(request, response) {
 async function proxyNativeAnthropic(request, response, input) {
   const wantsStream = input.stream === true
   const session = requestSession(request.headers, input)
+  const stats = createRequestStats("messages-native", input.model, wantsStream)
   const controller = new AbortController()
   response.on("close", () => controller.abort())
 
@@ -453,9 +688,13 @@ async function proxyNativeAnthropic(request, response, input) {
 
   if ("error" in upstream) {
     if (upstream.error?.name === "AbortError") {
+      stats.error = "aborted"
+      logRequest(stats)
       response.end()
       return
     }
+    stats.error = upstream.error instanceof Error ? upstream.error.message : String(upstream.error)
+    logRequest(stats)
     json(
       response,
       502,
@@ -464,13 +703,16 @@ async function proxyNativeAnthropic(request, response, input) {
     return
   }
 
-  console.log(`[zen-proxy] ${upstream.status} messages model=${input.model ?? "unknown"} stream=${wantsStream}`)
+  stats.status = upstream.status
   if (!upstream.ok) {
     const text = await upstream.text()
     if (ANTHROPIC_MODE === "auto" && upstream.status === 400 && isModelProtocolUnsupported(text)) {
-      console.log("[zen-proxy] native messages unsupported; falling back to chat completions")
+      stats.error = "native messages unsupported; falling back"
+      logRequest(stats)
       return "fallback"
     }
+    stats.error = readUpstreamError(text).message
+    logRequest(stats)
     json(response, upstream.status, anthropicUpstreamError(text))
     return "done"
   }
@@ -482,11 +724,18 @@ async function proxyNativeAnthropic(request, response, input) {
       "cache-control": "no-cache",
       connection: "keep-alive",
     })
-    await pipeBody(upstream, response)
+    const result = await pipeBody(upstream, response, stats)
+    stats.usage = result?.usage
+    stats.error = result?.error
+    logRequest(stats)
     return "done"
   }
 
   const text = await upstream.text()
+  const parsed = parseBody(text)
+  stats.usage = parsed?.usage
+  if (parsed?.error) stats.error = readUpstreamError(text).message
+  logRequest(stats)
   response.writeHead(200, {
     "content-type": contentType || "application/json",
     "cache-control": "no-store",
@@ -501,6 +750,7 @@ async function proxyAnthropicViaChat(request, response, input) {
   const rewritten = rewriteBody(converted.body, wantsStream)
   const body = rewritten.body
   const session = requestSession(request.headers, input)
+  const stats = createRequestStats("anthropic", input.model, wantsStream)
   const controller = new AbortController()
   response.on("close", () => controller.abort())
 
@@ -513,9 +763,13 @@ async function proxyAnthropicViaChat(request, response, input) {
 
   if ("error" in upstream) {
     if (upstream.error?.name === "AbortError") {
+      stats.error = "aborted"
+      logRequest(stats)
       response.end()
       return
     }
+    stats.error = upstream.error instanceof Error ? upstream.error.message : String(upstream.error)
+    logRequest(stats)
     json(
       response,
       502,
@@ -524,11 +778,11 @@ async function proxyAnthropicViaChat(request, response, input) {
     return
   }
 
-  console.log(
-    `[zen-proxy] ${upstream.status} anthropic->chat model=${input.model ?? "unknown"} stream=${wantsStream}`,
-  )
+  stats.status = upstream.status
   if (!upstream.ok) {
     const text = await upstream.text()
+    stats.error = readUpstreamError(text).message
+    logRequest(stats)
     json(response, upstream.status, anthropicUpstreamError(text))
     return
   }
@@ -540,7 +794,17 @@ async function proxyAnthropicViaChat(request, response, input) {
       "cache-control": "no-cache",
       connection: "keep-alive",
     })
-    await translateChatToAnthropicStream(upstream, response, input.model, converted.registry, rewritten.injectedRead)
+    const result = await translateChatToAnthropicStream(
+      upstream,
+      response,
+      input.model,
+      converted.registry,
+      rewritten.injectedRead,
+      stats,
+    )
+    stats.usage = result?.usage
+    stats.error = result?.error
+    logRequest(stats)
     return
   }
 
@@ -549,12 +813,19 @@ async function proxyAnthropicViaChat(request, response, input) {
     const chat = parseBody(text)
     if (chat) {
       if (chat.error) {
+        stats.error = readUpstreamError(text).message
+        logRequest(stats)
         json(response, 502, anthropicUpstreamError(text))
         return
       }
-      json(response, 200, chatToAnthropic(chat, input.model, converted.registry, rewritten.injectedRead))
+      const translated = chatToAnthropic(chat, input.model, converted.registry, rewritten.injectedRead)
+      stats.usage = translated.usage
+      logRequest(stats)
+      json(response, 200, translated)
       return
     }
+    stats.error = "Upstream returned a non-JSON response"
+    logRequest(stats)
     response.writeHead(200, {
       "content-type": contentType || "application/json",
       "cache-control": "no-store",
@@ -563,11 +834,21 @@ async function proxyAnthropicViaChat(request, response, input) {
     return
   }
 
-  json(
-    response,
-    200,
-    chatToAnthropic(await aggregate(upstream, rewritten.injectedRead), input.model, converted.registry, rewritten.injectedRead),
-  )
+  try {
+    const translated = chatToAnthropic(
+      await aggregate(upstream, rewritten.injectedRead, stats),
+      input.model,
+      converted.registry,
+      rewritten.injectedRead,
+    )
+    stats.usage = translated.usage
+    logRequest(stats)
+    json(response, 200, translated)
+  } catch (error) {
+    stats.error = error instanceof Error ? error.message : String(error)
+    logRequest(stats)
+    throw error
+  }
 }
 
 function rewriteBody(input, wantsStream) {
@@ -1479,7 +1760,14 @@ function anthropicStopReason(reason, hasToolCalls) {
   return "end_turn"
 }
 
-async function translateChatToAnthropicStream(upstream, response, originalModel, registry, injectedRead = false) {
+async function translateChatToAnthropicStream(
+  upstream,
+  response,
+  originalModel,
+  registry,
+  injectedRead = false,
+  stats,
+) {
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
   const textFilter = new ControlTextFilter()
@@ -1563,6 +1851,7 @@ async function translateChatToAnthropicStream(upstream, response, originalModel,
   const flushFilters = () => {
     const reasoningText = reasoningFilter.flush()
     if (reasoningText) {
+      markOutput(stats)
       const reasoning = ensureReasoning()
       reasoning.text += reasoningText
       emit("content_block_delta", {
@@ -1572,6 +1861,7 @@ async function translateChatToAnthropicStream(upstream, response, originalModel,
     }
     const text = textFilter.flush()
     if (text) {
+      markOutput(stats)
       const block = ensureText()
       block.text += text
       emit("content_block_delta", { index: block.index, delta: { type: "text_delta", text } })
@@ -1596,6 +1886,7 @@ async function translateChatToAnthropicStream(upstream, response, originalModel,
       if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
         const value = reasoningFilter.push(delta.reasoning_content)
         if (value) {
+          markOutput(stats)
           const reasoning = ensureReasoning()
           reasoning.text += value
           emit("content_block_delta", {
@@ -1607,6 +1898,7 @@ async function translateChatToAnthropicStream(upstream, response, originalModel,
       if (typeof delta.content === "string" && delta.content.length > 0) {
         const value = textFilter.push(delta.content)
         if (value) {
+          markOutput(stats)
           const text = ensureText()
           text.text += value
           emit("content_block_delta", { index: text.index, delta: { type: "text_delta", text: value } })
@@ -1620,6 +1912,7 @@ async function translateChatToAnthropicStream(upstream, response, originalModel,
         if (call.id) tool.id = call.id
         if (call.function?.name && !tool.name) tool.name = call.function.name
         if (call.function?.arguments) {
+          markOutput(stats)
           tool.arguments += call.function.arguments
           emit("content_block_delta", {
             index: tool.index,
@@ -1651,7 +1944,7 @@ async function translateChatToAnthropicStream(upstream, response, originalModel,
   if (buffer.trim()) consume(buffer.trim())
   if (state.failed) {
     response.end()
-    return
+    return { usage: state.usage, error: state.failed }
   }
 
   flushFilters()
@@ -1682,9 +1975,17 @@ async function translateChatToAnthropicStream(upstream, response, originalModel,
   })
   emit("message_stop", {})
   response.end()
+  return { usage: state.usage, error: undefined }
 }
 
-async function translateChatStream(upstream, response, originalModel, registry, injectedRead = false) {
+async function translateChatStream(
+  upstream,
+  response,
+  originalModel,
+  registry,
+  injectedRead = false,
+  stats,
+) {
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
   const textFilter = new ControlTextFilter()
@@ -1793,6 +2094,7 @@ async function translateChatStream(upstream, response, originalModel, registry, 
   const flushFilters = () => {
     const reasoningText = reasoningFilter.flush()
     if (reasoningText) {
+      markOutput(stats)
       const reasoning = ensureReasoning()
       reasoning.text += reasoningText
       emit("response.reasoning_summary_text.delta", {
@@ -1804,6 +2106,7 @@ async function translateChatStream(upstream, response, originalModel, registry, 
     }
     const text = textFilter.flush()
     if (text) {
+      markOutput(stats)
       const message = ensureMessage()
       message.text += text
       emit("response.output_text.delta", {
@@ -1836,6 +2139,7 @@ async function translateChatStream(upstream, response, originalModel, registry, 
       if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
         const value = reasoningFilter.push(delta.reasoning_content)
         if (value) {
+          markOutput(stats)
           const reasoning = ensureReasoning()
           reasoning.text += value
           emit("response.reasoning_summary_text.delta", {
@@ -1849,6 +2153,7 @@ async function translateChatStream(upstream, response, originalModel, registry, 
       if (typeof delta.content === "string" && delta.content.length > 0) {
         const value = textFilter.push(delta.content)
         if (value) {
+          markOutput(stats)
           const message = ensureMessage()
           message.text += value
           emit("response.output_text.delta", {
@@ -1867,6 +2172,7 @@ async function translateChatStream(upstream, response, originalModel, registry, 
         if (call.id) tool.callID = call.id
         if (call.function?.name && !tool.name) tool.name = call.function.name
         if (call.function?.arguments) {
+          markOutput(stats)
           tool.arguments += call.function.arguments
           if (tool.custom) {
             tool.input = customToolInput(parseToolInput(tool.arguments))
@@ -1903,7 +2209,7 @@ async function translateChatStream(upstream, response, originalModel, registry, 
   if (buffer.trim()) consume(buffer.trim())
   if (state.failed) {
     response.end()
-    return
+    return { usage: state.usage, error: state.failed }
   }
 
   flushFilters()
@@ -1997,6 +2303,7 @@ async function translateChatStream(upstream, response, originalModel, registry, 
   const terminal = status === "incomplete" ? "response.incomplete" : "response.completed"
   emit(terminal, { response: responseObject(status, items.map((item) => item.item)) })
   response.end()
+  return { usage: state.usage, error: undefined }
 }
 
 function responsesMode(model) {
@@ -2051,7 +2358,7 @@ function buildHeaders(incoming, wantsStream, session = SESSION) {
   })
 }
 
-async function aggregate(upstream, injectedRead = false) {
+async function aggregate(upstream, injectedRead = false, stats) {
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
   const textFilter = new ControlTextFilter()
@@ -2087,11 +2394,16 @@ async function aggregate(upstream, injectedRead = false) {
     if (chunk.usage) result.usage = chunk.usage
     for (const choice of chunk.choices ?? []) {
       const delta = choice.delta ?? {}
-      if (typeof delta.content === "string") result.content += textFilter.push(delta.content)
-      if (typeof delta.reasoning_content === "string") {
+      if (typeof delta.content === "string" && delta.content.length > 0) {
+        markOutput(stats)
+        result.content += textFilter.push(delta.content)
+      }
+      if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+        markOutput(stats)
         result.reasoning += reasoningFilter.push(delta.reasoning_content)
       }
       if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+        markOutput(stats)
         result.content += textFilter.flush()
         result.reasoning += reasoningFilter.flush()
         textFilter.reset()
@@ -2137,7 +2449,7 @@ async function aggregate(upstream, injectedRead = false) {
   }
 }
 
-async function aggregateResponses(upstream) {
+async function aggregateResponses(upstream, stats) {
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
   const output = new Map()
@@ -2157,6 +2469,7 @@ async function aggregateResponses(upstream) {
     if (!data || data === "[DONE]") return
     const event = parseBody(data)
     if (!event) return
+    if (typeof event.type === "string" && event.type.endsWith(".delta")) markOutput(stats)
 
     if (event.response?.id) {
       id = event.response.id
@@ -2169,6 +2482,7 @@ async function aggregateResponses(upstream) {
     }
 
     if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
+      markOutput(stats)
       text += event.delta
       return
     }
@@ -2255,24 +2569,58 @@ function mergeToolCalls(target, calls) {
   }
 }
 
-async function pipeBody(upstream, response) {
+async function pipeBody(upstream, response, stats) {
   if (!upstream.body) {
     response.end()
-    return
+    return { usage: undefined, error: "upstream returned an empty stream" }
   }
   const reader = upstream.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  let usage
+  let error
+  const consume = (line) => {
+    if (!line.startsWith("data:")) return
+    const data = line.slice(5).trim()
+    if (!data || data === "[DONE]") return
+    const event = parseBody(data)
+    if (!event) return
+    if (event.response?.usage) usage = event.response.usage
+    if (event.message?.usage) usage = { ...usage, ...event.message.usage }
+    if (event.usage) usage = { ...usage, ...event.usage }
+    if (event.type === "content_block_delta" || event.type?.endsWith(".delta")) markOutput(stats)
+    if (event.type === "error") {
+      error =
+        (typeof event.error === "string" ? event.error : event.error?.message) ??
+        "Upstream stream error"
+    }
+    if (event.type === "response.failed") {
+      const detail = event.response?.error ?? event.error
+      error = (typeof detail === "string" ? detail : detail?.message) ?? "Upstream response failed"
+    }
+  }
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
     response.write(value)
+    buffer += decoder.decode(value, { stream: true })
+    let newline = buffer.indexOf("\n")
+    while (newline !== -1) {
+      consume(buffer.slice(0, newline).replace(/\r$/, ""))
+      buffer = buffer.slice(newline + 1)
+      newline = buffer.indexOf("\n")
+    }
   }
+  buffer += decoder.decode()
+  if (buffer.trim()) consume(buffer.trim())
   response.end()
+  return { usage, error }
 }
 
-async function pipeChatStream(upstream, response, injectedRead = false) {
+async function pipeChatStream(upstream, response, injectedRead = false, stats) {
   if (!upstream.body) {
     response.end()
-    return
+    return { usage: undefined, error: "upstream returned an empty stream" }
   }
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
@@ -2285,6 +2633,8 @@ async function pipeChatStream(upstream, response, injectedRead = false) {
   }
   let buffer = ""
   let done = false
+  let usage
+  let error
 
   const write = (value) => {
     if (response.writableEnded || response.destroyed) return
@@ -2297,6 +2647,7 @@ async function pipeChatStream(upstream, response, injectedRead = false) {
     const reasoning = reasoningFilter.flush()
     if (reasoning) delta.reasoning_content = reasoning
     if (Object.keys(delta).length === 0) return
+    markOutput(stats)
     write({
       id: meta.id,
       object: "chat.completion.chunk",
@@ -2316,11 +2667,17 @@ async function pipeChatStream(upstream, response, injectedRead = false) {
     }
     const chunk = parseBody(data)
     if (!chunk) return
+    if (chunk.usage) usage = chunk.usage
+    if (chunk.error) {
+      error =
+        (typeof chunk.error === "string" ? chunk.error : chunk.error.message) ?? "Upstream stream error"
+    }
     if (chunk.id) meta.id = chunk.id
     if (chunk.created) meta.created = chunk.created
     if (chunk.model) meta.model = chunk.model
     const hasFinish = (chunk.choices ?? []).some((choice) => choice?.finish_reason)
     let hasToolCalls = false
+    let hasOutput = false
     for (const choice of chunk.choices ?? []) {
       const delta = choice?.delta
       if (!delta) continue
@@ -2328,16 +2685,21 @@ async function pipeChatStream(upstream, response, injectedRead = false) {
         const text = textFilter.push(delta.content)
         if (text) delta.content = text
         else delete delta.content
+        if (text) hasOutput = true
       }
       if (typeof delta.reasoning_content === "string") {
         const reasoning = reasoningFilter.push(delta.reasoning_content)
         if (reasoning) delta.reasoning_content = reasoning
         else delete delta.reasoning_content
+        if (reasoning) hasOutput = true
       }
       if (injectedRead && Array.isArray(delta.tool_calls)) {
         delta.tool_calls = delta.tool_calls.filter((call) => call.function?.name !== "read")
       }
-      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) hasToolCalls = true
+      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+        hasToolCalls = true
+        hasOutput = true
+      }
     }
     if (hasToolCalls) {
       flushFilters()
@@ -2345,6 +2707,7 @@ async function pipeChatStream(upstream, response, injectedRead = false) {
       reasoningFilter.reset()
     }
     if (hasFinish) flushFilters()
+    if (hasOutput) markOutput(stats)
     write(chunk)
   }
 
@@ -2363,6 +2726,7 @@ async function pipeChatStream(upstream, response, injectedRead = false) {
   if (buffer.trim()) consume(buffer.trim())
   if (!done) flushFilters()
   response.end()
+  return { usage, error }
 }
 
 async function readBody(request) {

@@ -30,6 +30,10 @@ node opencode-zen-proxy.mjs
 
 The proxy listens on `http://127.0.0.1:8787/v1` by default.
 
+If the preferred port is in use, the proxy automatically tries the next ports (up to `PORT_ATTEMPTS`) and prints the actual listening address at startup.
+
+Each request log includes a timestamp, status, model, stream mode, input/output/total tokens, cached and reasoning tokens, total elapsed time, first-token latency (TTFT), the observed generation window, and output tokens per second measured over that window.
+
 ### Client settings
 
 | Setting | Value |
@@ -185,6 +189,8 @@ The translation covers:
 | --- | --- | --- |
 | `PORT` | `8787` | Listen port |
 | `HOST` | `127.0.0.1` | Listen host |
+| `PORT_ATTEMPTS` | `20` | Try up to this many consecutive ports when the preferred port is in use |
+| `LOG_TIME_ZONE` | `Asia/Hong_Kong` | Time zone used for log timestamps |
 | `OPENCODE_ZEN_BASE_URL` | `https://opencode.ai/zen/v1` | Upstream base URL |
 | `OPENCODE_PROXY_UA` | `opencode/latest/2.0.32/cli` | Upstream User-Agent |
 | `OPENCODE_PROXY_SESSION` | generated | Fixed `ses_...` session; otherwise derived per client conversation |

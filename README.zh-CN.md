@@ -30,6 +30,10 @@ node opencode-zen-proxy.mjs
 
 默认监听地址：`http://127.0.0.1:8787/v1`。
 
+如果首选端口已被占用，代理会自动尝试后续端口（最多 `PORT_ATTEMPTS` 个），并在启动日志中打印实际监听地址。
+
+每个请求日志包含时间、状态码、模型、流式模式、输入/输出/总 token、缓存与推理 token、总耗时、首 token 延迟（TTFT）、实际生成窗口，以及按该窗口计算的输出速度（tok/s）。
+
 ### 客户端配置
 
 | 配置项 | 值 |
@@ -185,6 +189,8 @@ node opencode-zen-proxy.mjs
 | --- | --- | --- |
 | `PORT` | `8787` | 监听端口 |
 | `HOST` | `127.0.0.1` | 监听地址 |
+| `PORT_ATTEMPTS` | `20` | 首选端口被占用时，最多向后尝试的连续端口数 |
+| `LOG_TIME_ZONE` | `Asia/Hong_Kong` | 日志时间戳使用的时区 |
 | `OPENCODE_ZEN_BASE_URL` | `https://opencode.ai/zen/v1` | 上游基础地址 |
 | `OPENCODE_PROXY_UA` | `opencode/latest/2.0.32/cli` | 上游 User-Agent |
 | `OPENCODE_PROXY_SESSION` | 自动生成 | 固定 `ses_...` 会话；未设置时按客户端会话自动派生 |
