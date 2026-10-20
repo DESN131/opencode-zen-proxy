@@ -31,7 +31,8 @@
  */
 
 import http from "node:http"
-import { randomBytes } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
+import { gunzipSync, gzipSync } from "node:zlib"
 
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 const PORT = Number(process.env.PORT ?? 8787)
@@ -45,6 +46,8 @@ const PASSTHROUGH_AUTH = process.env.OPENCODE_PROXY_PASSTHROUGH_AUTH === "1"
 const RESPONSES_MODE = process.env.OPENCODE_PROXY_RESPONSES_MODE ?? "auto"
 const ANTHROPIC_MODE = process.env.OPENCODE_PROXY_ANTHROPIC_MODE ?? "auto"
 const MAX_BODY_BYTES = 64 * 1024 * 1024
+const REASONING_PREFIX = "zen1:"
+const FIXED_SESSION = process.env.OPENCODE_PROXY_SESSION
 
 // The free-tier gate checks for a tool named `read`. This minimal definition is
 // enough; tools already supplied by the caller are preserved.
@@ -52,7 +55,8 @@ const READ_TOOL = {
   type: "function",
   function: {
     name: "read",
-    description: "Read the contents of a file or directory.",
+    description:
+      "Compatibility marker only. Do not call this tool; use the caller's own tools for reading files.",
     parameters: {
       type: "object",
       properties: {
@@ -69,7 +73,8 @@ const READ_TOOL = {
 const RESPONSES_READ_TOOL = {
   type: "function",
   name: "read",
-  description: "Read the contents of a file or directory.",
+  description:
+    "Compatibility marker only. Do not call this tool; use the caller's own tools for reading files.",
   parameters: {
     type: "object",
     properties: {
@@ -87,7 +92,14 @@ const server = http.createServer((request, response) => {
     if (error?.name === "AbortError" || (error instanceof Error && error.message.includes("aborted"))) return
     console.error(`[zen-proxy] ${error instanceof Error ? error.message : String(error)}`)
     const status = typeof error?.status === "number" ? error.status : 500
-    if (!response.headersSent) return json(response, status, proxyError(error))
+    if (!response.headersSent) {
+      const target = String(request.url ?? "")
+      return json(
+        response,
+        status,
+        target.endsWith("/messages") ? anthropicUpstreamError(error instanceof Error ? error.message : String(error)) : proxyError(error),
+      )
+    }
     response.end()
   })
 })
@@ -148,6 +160,7 @@ async function proxyModels(response) {
       "accept-encoding": "identity",
       "user-agent": USER_AGENT,
     },
+    signal: AbortSignal.timeout(10000),
   })
   const body = await upstream.text()
   response.writeHead(upstream.status, {
@@ -164,15 +177,25 @@ async function proxyChat(request, response) {
     json(response, 400, { error: { type: "invalid_request", message: "Request body must be a JSON object" } })
     return
   }
+  if (typeof input.model !== "string" || input.model.trim().length === 0) {
+    json(response, 400, { error: { type: "invalid_request", message: "model is required" } })
+    return
+  }
+  if (!Array.isArray(input.messages)) {
+    json(response, 400, { error: { type: "invalid_request", message: "messages must be an array" } })
+    return
+  }
 
   const wantsStream = input.stream === true
-  const body = rewriteBody(input, wantsStream)
+  const rewritten = rewriteBody(input, wantsStream)
+  const body = rewritten.body
+  const session = requestSession(request.headers, input)
   const controller = new AbortController()
   response.on("close", () => controller.abort())
 
   const upstream = await fetch(`${UPSTREAM}/chat/completions`, {
     method: "POST",
-    headers: buildHeaders(request.headers, wantsStream),
+    headers: buildHeaders(request.headers, wantsStream, session),
     body: JSON.stringify(body),
     signal: controller.signal,
   }).catch((error) => ({ error }))
@@ -189,11 +212,7 @@ async function proxyChat(request, response) {
   console.log(`[zen-proxy] ${upstream.status} model=${input.model ?? "unknown"} stream=${wantsStream}`)
   if (!upstream.ok) {
     const text = await upstream.text()
-    response.writeHead(upstream.status, {
-      "content-type": upstream.headers.get("content-type") ?? "application/json",
-      "cache-control": "no-store",
-    })
-    response.end(text)
+    json(response, upstream.status, openAIUpstreamError(text))
     return
   }
 
@@ -204,12 +223,32 @@ async function proxyChat(request, response) {
       "cache-control": "no-cache",
       connection: "keep-alive",
     })
-    await pipeBody(upstream, response)
+    await pipeChatStream(upstream, response, rewritten.injectedRead)
     return
   }
 
   if (!contentType.toLowerCase().includes("text/event-stream")) {
     const text = await upstream.text()
+    const chat = parseBody(text)
+    if (chat) {
+      if (chat.error) {
+        json(response, 502, openAIUpstreamError(text))
+        return
+      }
+      for (const choice of chat.choices ?? []) {
+        const message = choice?.message
+        if (!message) continue
+        if (typeof message.content === "string") message.content = stripThinkControl(message.content)
+        if (typeof message.reasoning_content === "string") {
+          message.reasoning_content = stripThinkControl(message.reasoning_content)
+        }
+        if (rewritten.injectedRead && Array.isArray(message.tool_calls)) {
+          message.tool_calls = message.tool_calls.filter((call) => call.function?.name !== "read")
+        }
+      }
+      json(response, 200, chat)
+      return
+    }
     response.writeHead(200, {
       "content-type": contentType || "application/json",
       "cache-control": "no-store",
@@ -218,7 +257,7 @@ async function proxyChat(request, response) {
     return
   }
 
-  json(response, 200, await aggregate(upstream))
+  json(response, 200, await aggregate(upstream, rewritten.injectedRead))
 }
 
 async function proxyResponses(request, response) {
@@ -226,6 +265,14 @@ async function proxyResponses(request, response) {
   const input = parseBody(raw)
   if (!input) {
     json(response, 400, { error: { type: "invalid_request", message: "Request body must be a JSON object" } })
+    return
+  }
+  if (typeof input.model !== "string" || input.model.trim().length === 0) {
+    json(response, 400, { error: { type: "invalid_request", message: "model is required" } })
+    return
+  }
+  if (typeof input.input !== "string" && !Array.isArray(input.input)) {
+    json(response, 400, { error: { type: "invalid_request", message: "input must be a string or an array" } })
     return
   }
 
@@ -241,12 +288,13 @@ async function proxyResponses(request, response) {
 async function proxyNativeResponses(request, response, input) {
   const wantsStream = input.stream === true
   const body = rewriteResponsesBody(input)
+  const session = requestSession(request.headers, input)
   const controller = new AbortController()
   response.on("close", () => controller.abort())
 
   const upstream = await fetch(`${UPSTREAM}/responses`, {
     method: "POST",
-    headers: buildHeaders(request.headers, wantsStream),
+    headers: buildHeaders(request.headers, wantsStream, session),
     body: JSON.stringify(body),
     signal: controller.signal,
   }).catch((error) => ({ error }))
@@ -267,11 +315,7 @@ async function proxyNativeResponses(request, response, input) {
       console.log("[zen-proxy] native responses unsupported; falling back to chat completions")
       return "fallback"
     }
-    response.writeHead(upstream.status, {
-      "content-type": upstream.headers.get("content-type") ?? "application/json",
-      "cache-control": "no-store",
-    })
-    response.end(text)
+    json(response, upstream.status, openAIUpstreamError(text))
     return
   }
 
@@ -302,13 +346,16 @@ async function proxyNativeResponses(request, response, input) {
 
 async function proxyResponsesViaChat(request, response, input) {
   const wantsStream = input.stream === true
-  const body = rewriteBody(responsesToChat(input), wantsStream)
+  const converted = responsesToChat(input)
+  const rewritten = rewriteBody(converted.body, wantsStream)
+  const body = rewritten.body
+  const session = requestSession(request.headers, input)
   const controller = new AbortController()
   response.on("close", () => controller.abort())
 
   const upstream = await fetch(`${UPSTREAM}/chat/completions`, {
     method: "POST",
-    headers: buildHeaders(request.headers, wantsStream),
+    headers: buildHeaders(request.headers, wantsStream, session),
     body: JSON.stringify(body),
     signal: controller.signal,
   }).catch((error) => ({ error }))
@@ -325,11 +372,7 @@ async function proxyResponsesViaChat(request, response, input) {
   console.log(`[zen-proxy] ${upstream.status} responses->chat model=${input.model ?? "unknown"} stream=${wantsStream}`)
   if (!upstream.ok) {
     const text = await upstream.text()
-    response.writeHead(upstream.status, {
-      "content-type": upstream.headers.get("content-type") ?? "application/json",
-      "cache-control": "no-store",
-    })
-    response.end(text)
+    json(response, upstream.status, openAIUpstreamError(text))
     return
   }
 
@@ -340,7 +383,7 @@ async function proxyResponsesViaChat(request, response, input) {
       "cache-control": "no-cache",
       connection: "keep-alive",
     })
-    await translateChatStream(upstream, response, input.model)
+    await translateChatStream(upstream, response, input.model, converted.registry, rewritten.injectedRead)
     return
   }
 
@@ -348,7 +391,11 @@ async function proxyResponsesViaChat(request, response, input) {
     const text = await upstream.text()
     const chat = parseBody(text)
     if (chat) {
-      json(response, 200, chatToResponse(chat, input.model))
+      if (chat.error) {
+        json(response, 502, openAIUpstreamError(text))
+        return
+      }
+      json(response, 200, chatToResponse(chat, input.model, converted.registry, rewritten.injectedRead))
       return
     }
     response.writeHead(200, {
@@ -359,7 +406,11 @@ async function proxyResponsesViaChat(request, response, input) {
     return
   }
 
-  json(response, 200, chatToResponse(await aggregate(upstream), input.model))
+  json(
+    response,
+    200,
+    chatToResponse(await aggregate(upstream, rewritten.injectedRead), input.model, converted.registry, rewritten.injectedRead),
+  )
 }
 
 async function proxyAnthropic(request, response) {
@@ -367,6 +418,14 @@ async function proxyAnthropic(request, response) {
   const input = parseBody(raw)
   if (!input) {
     json(response, 400, { error: { type: "invalid_request", message: "Request body must be a JSON object" } })
+    return
+  }
+  if (typeof input.model !== "string" || input.model.trim().length === 0) {
+    json(response, 400, { error: { type: "invalid_request", message: "model is required" } })
+    return
+  }
+  if (!Array.isArray(input.messages)) {
+    json(response, 400, { error: { type: "invalid_request", message: "messages must be an array" } })
     return
   }
 
@@ -381,12 +440,13 @@ async function proxyAnthropic(request, response) {
 
 async function proxyNativeAnthropic(request, response, input) {
   const wantsStream = input.stream === true
+  const session = requestSession(request.headers, input)
   const controller = new AbortController()
   response.on("close", () => controller.abort())
 
   const upstream = await fetch(`${UPSTREAM}/messages`, {
     method: "POST",
-    headers: buildAnthropicHeaders(request.headers, wantsStream),
+    headers: buildAnthropicHeaders(request.headers, wantsStream, session),
     body: JSON.stringify(input),
     signal: controller.signal,
   }).catch((error) => ({ error }))
@@ -396,7 +456,11 @@ async function proxyNativeAnthropic(request, response, input) {
       response.end()
       return
     }
-    json(response, 502, proxyError(upstream.error))
+    json(
+      response,
+      502,
+      anthropicUpstreamError(upstream.error instanceof Error ? upstream.error.message : String(upstream.error)),
+    )
     return
   }
 
@@ -407,11 +471,7 @@ async function proxyNativeAnthropic(request, response, input) {
       console.log("[zen-proxy] native messages unsupported; falling back to chat completions")
       return "fallback"
     }
-    response.writeHead(upstream.status, {
-      "content-type": upstream.headers.get("content-type") ?? "application/json",
-      "cache-control": "no-store",
-    })
-    response.end(text)
+    json(response, upstream.status, anthropicUpstreamError(text))
     return "done"
   }
 
@@ -437,13 +497,16 @@ async function proxyNativeAnthropic(request, response, input) {
 
 async function proxyAnthropicViaChat(request, response, input) {
   const wantsStream = input.stream === true
-  const body = rewriteBody(anthropicToChat(input), wantsStream)
+  const converted = anthropicToChat(input)
+  const rewritten = rewriteBody(converted.body, wantsStream)
+  const body = rewritten.body
+  const session = requestSession(request.headers, input)
   const controller = new AbortController()
   response.on("close", () => controller.abort())
 
   const upstream = await fetch(`${UPSTREAM}/chat/completions`, {
     method: "POST",
-    headers: buildHeaders(request.headers, wantsStream),
+    headers: buildHeaders(request.headers, wantsStream, session),
     body: JSON.stringify(body),
     signal: controller.signal,
   }).catch((error) => ({ error }))
@@ -453,7 +516,11 @@ async function proxyAnthropicViaChat(request, response, input) {
       response.end()
       return
     }
-    json(response, 502, proxyError(upstream.error))
+    json(
+      response,
+      502,
+      anthropicUpstreamError(upstream.error instanceof Error ? upstream.error.message : String(upstream.error)),
+    )
     return
   }
 
@@ -462,11 +529,7 @@ async function proxyAnthropicViaChat(request, response, input) {
   )
   if (!upstream.ok) {
     const text = await upstream.text()
-    response.writeHead(upstream.status, {
-      "content-type": upstream.headers.get("content-type") ?? "application/json",
-      "cache-control": "no-store",
-    })
-    response.end(text)
+    json(response, upstream.status, anthropicUpstreamError(text))
     return
   }
 
@@ -477,7 +540,7 @@ async function proxyAnthropicViaChat(request, response, input) {
       "cache-control": "no-cache",
       connection: "keep-alive",
     })
-    await translateChatToAnthropicStream(upstream, response, input.model)
+    await translateChatToAnthropicStream(upstream, response, input.model, converted.registry, rewritten.injectedRead)
     return
   }
 
@@ -485,7 +548,11 @@ async function proxyAnthropicViaChat(request, response, input) {
     const text = await upstream.text()
     const chat = parseBody(text)
     if (chat) {
-      json(response, 200, chatToAnthropic(chat, input.model))
+      if (chat.error) {
+        json(response, 502, anthropicUpstreamError(text))
+        return
+      }
+      json(response, 200, chatToAnthropic(chat, input.model, converted.registry, rewritten.injectedRead))
       return
     }
     response.writeHead(200, {
@@ -496,11 +563,16 @@ async function proxyAnthropicViaChat(request, response, input) {
     return
   }
 
-  json(response, 200, chatToAnthropic(await aggregate(upstream), input.model))
+  json(
+    response,
+    200,
+    chatToAnthropic(await aggregate(upstream, rewritten.injectedRead), input.model, converted.registry, rewritten.injectedRead),
+  )
 }
 
 function rewriteBody(input, wantsStream) {
-  const messages = Array.isArray(input.messages) ? input.messages.map(normalizeChatMessage) : input.messages
+  const source = Array.isArray(input.messages) ? input.messages.map(normalizeChatMessage) : input.messages
+  const { messages, effort: directiveEffort } = stripChatDirective(source)
   const hasReasoning =
     (Array.isArray(messages) &&
       messages.some((message) => message?.role === "assistant" && typeof message.reasoning_content === "string")) ||
@@ -514,9 +586,24 @@ function rewriteBody(input, wantsStream) {
     : messages
   const body = { ...input, messages: normalized, stream: true }
   const tools = Array.isArray(input.tools) ? [...input.tools] : []
-  const hasRead = tools.some((tool) => tool?.type === "function" && tool?.function?.name === "read")
+  const hasRead = tools.some((tool) => tool?.function?.name === "read" || tool?.name === "read")
   if (!hasRead) tools.push(READ_TOOL)
   body.tools = tools
+
+  const injectedRead = !hasRead
+  if (injectedRead && tools.length > 1 && Array.isArray(normalized)) {
+    const warning = {
+      role: "system",
+      content:
+        "The `read` tool is a proxy compatibility marker. Do not call it; use the caller's tools for all work.",
+    }
+    const index = normalized.findIndex((message) => message?.role !== "system")
+    normalized.splice(index === -1 ? normalized.length : index, 0, warning)
+  }
+
+  const effort = normalizeChatEffort(input.reasoning_effort ?? input.reasoning?.effort ?? directiveEffort)
+  if (effort !== undefined) body.reasoning_effort = effort
+  else if (input.reasoning_effort !== undefined) delete body.reasoning_effort
 
   // If the caller did not ask for tools, prevent the compatibility marker from
   // being selected while still keeping it in the request for the gate.
@@ -524,15 +611,42 @@ function rewriteBody(input, wantsStream) {
   if (!Array.isArray(input.tools) || input.tools.length === 0) {
     if (body.tool_choice === undefined) body.tool_choice = "none"
   }
-  return body
+  return { body, injectedRead }
 }
 
 function normalizeChatMessage(message) {
   if (!message || message.role !== "assistant") return message
-  if (typeof message.reasoning_content === "string") return message
-  if (typeof message.reasoning === "string") return { ...message, reasoning_content: message.reasoning }
-  if (typeof message.reasoning_text === "string") return { ...message, reasoning_content: message.reasoning_text }
+  if (typeof message.reasoning_content === "string") {
+    return { ...message, reasoning_content: stripThinkControl(message.reasoning_content) }
+  }
+  if (typeof message.reasoning === "string") {
+    return { ...message, reasoning_content: stripThinkControl(message.reasoning) }
+  }
+  if (typeof message.reasoning_text === "string") {
+    return { ...message, reasoning_content: stripThinkControl(message.reasoning_text) }
+  }
   return message
+}
+
+function stripChatDirective(messages) {
+  if (!Array.isArray(messages)) return { messages, effort: undefined }
+  const lastUserIndex = lastMessageIndex(messages, "user")
+  let effort
+  const normalized = messages.map((message, index) => {
+    if (index !== lastUserIndex || message?.role !== "user") return message
+    if (typeof message.content === "string") {
+      const text = readThinkDirective(message.content, (value) => (effort = value))
+      return { ...message, content: text }
+    }
+    if (Array.isArray(message.content)) {
+      return {
+        ...message,
+        content: stripThinkFromParts(message.content, (value) => (effort = value)),
+      }
+    }
+    return message
+  })
+  return { messages: normalized, effort }
 }
 
 function knownReasoningModel(model) {
@@ -544,12 +658,314 @@ function knownReasoningModel(model) {
   )
 }
 
+function buildChatToolRegistry(tools) {
+  const registry = {
+    tools: [],
+    byName: new Map(),
+    byClient: new Map(),
+    bySimpleName: new Map(),
+  }
+  const used = new Set()
+
+  const add = (descriptor) => {
+    const base = sanitizeToolName(descriptor.upstreamName) || "tool"
+    let name = base
+    let suffix = 2
+    while (used.has(name)) name = `${base}_${suffix++}`
+    used.add(name)
+    const entry = { ...descriptor, upstreamName: name }
+    registry.tools.push({
+      type: "function",
+      function: {
+        name,
+        description: entry.description ?? "",
+        parameters: entry.input_schema,
+      },
+    })
+    registry.byName.set(name, entry)
+    for (const clientName of entry.clientNames ?? []) registry.byClient.set(clientName, name)
+    const simple = registry.bySimpleName.get(entry.name) ?? []
+    if (!simple.includes(name)) simple.push(name)
+    registry.bySimpleName.set(entry.name, simple)
+  }
+
+  for (const tool of Array.isArray(tools) ? tools : []) {
+    if (!tool || typeof tool !== "object") continue
+
+    if (tool.type === "namespace") {
+      const namespace = tool.name
+      if (!namespace) continue
+      for (const nested of Array.isArray(tool.tools) ? tool.tools : []) {
+        if (!nested || typeof nested !== "object") continue
+        const description = [tool.description ? `[${namespace}] ${tool.description}` : `[${namespace}]`, nested.description]
+          .filter(Boolean)
+          .join("\n\n")
+        if (nested.type === "custom") {
+          add(customToolDescriptor(nested, namespace, description))
+          continue
+        }
+        if (nested.type === "function" && nested.name) {
+          add({
+            kind: "function",
+            name: nested.name,
+            namespace,
+            upstreamName: `${namespace}__${nested.name}`,
+            description,
+            input_schema: normalizeInputSchema(nested.parameters),
+            clientNames: [`${namespace}__${nested.name}`, `${namespace}.${nested.name}`],
+          })
+        }
+      }
+      continue
+    }
+
+    if (tool.type === "custom" && tool.name) {
+      add(customToolDescriptor(tool))
+      continue
+    }
+
+    const functionSpec = tool.type === "function" ? tool : tool.type === undefined ? tool : undefined
+    if (!functionSpec) continue
+    const name = functionSpec.name ?? functionSpec.function?.name
+    if (!name) continue
+    add({
+      kind: "function",
+      name,
+      namespace: tool.namespace ?? null,
+      upstreamName: tool.namespace ? `${tool.namespace}__${name}` : name,
+      description: functionSpec.description ?? functionSpec.function?.description ?? "",
+      input_schema: normalizeInputSchema(
+        functionSpec.parameters ?? functionSpec.function?.parameters ?? functionSpec.input_schema,
+      ),
+      clientNames: tool.namespace ? [`${tool.namespace}__${name}`, `${tool.namespace}.${name}`] : [name],
+    })
+  }
+
+  return registry
+}
+
+function customToolDescriptor(tool, namespace, description) {
+  const prefix = namespace ? `[${namespace}] ` : ""
+  const base = description ?? `${prefix}${tool.description ?? ""}`
+  return {
+    kind: "custom",
+    name: tool.name,
+    namespace: namespace ?? null,
+    upstreamName: namespace ? `${namespace}__${tool.name}` : tool.name,
+    description: `${base}\n\nThe function-calling API requires a JSON object, but the "input" field itself is the exact freeform text. Put the complete raw input there without escaping, quoting, or JSON-encoding that value.`,
+    input_schema: {
+      type: "object",
+      properties: {
+        input: { type: "string", description: "The complete raw tool input." },
+      },
+      required: ["input"],
+      additionalProperties: false,
+    },
+    clientNames: namespace ? [`${namespace}__${tool.name}`, `${namespace}.${tool.name}`] : [tool.name],
+  }
+}
+
+function normalizeInputSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return { type: "object", properties: {} }
+  }
+  return {
+    ...schema,
+    type: "object",
+    properties: schema.properties ?? {},
+    ...(Array.isArray(schema.required) ? { required: schema.required } : {}),
+  }
+}
+
+function sanitizeToolName(value) {
+  return String(value ?? "")
+    .replace(/[^A-Za-z0-9_-]/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 64)
+}
+
+function resolveToolName(registry, name, namespace) {
+  const raw = String(name ?? "")
+  if (namespace) {
+    const qualified = registry.byClient.get(`${namespace}__${raw}`) ?? registry.byClient.get(`${namespace}.${raw}`)
+    if (qualified) return qualified
+  }
+  const direct = registry.byClient.get(raw)
+  if (direct) return direct
+  const simple = registry.bySimpleName.get(raw)
+  if (simple?.length === 1) return simple[0]
+  return sanitizeToolName(raw)
+}
+
+function customToolInput(value) {
+  if (typeof value === "string") return value
+  if (value && typeof value === "object") {
+    if (typeof value.input === "string") return value.input
+    if (typeof value.patch === "string") return value.patch
+    if (typeof value.content === "string") return value.content
+    const strings = Object.values(value).filter((entry) => typeof entry === "string")
+    if (strings.length === 1) return strings[0]
+  }
+  return JSON.stringify(value ?? "")
+}
+
+function reasoningTextFromItem(item) {
+  const content = []
+  for (const part of Array.isArray(item.content) ? item.content : []) {
+    if (part?.type === "reasoning_text" && typeof part.text === "string") content.push(part.text)
+  }
+  if (content.length > 0) return content.join("")
+  const summary = []
+  for (const part of Array.isArray(item.summary) ? item.summary : []) {
+    if (part?.type === "summary_text" && typeof part.text === "string") summary.push(part.text)
+  }
+  if (summary.length > 0) return summary.join("")
+  return typeof item.text === "string" ? item.text : ""
+}
+
+function encodeReasoning(text) {
+  if (!text) return undefined
+  return REASONING_PREFIX + gzipSync(Buffer.from(text, "utf8")).toString("base64url")
+}
+
+function decodeReasoning(value) {
+  if (typeof value !== "string" || !value.startsWith(REASONING_PREFIX)) return undefined
+  try {
+    return gunzipSync(Buffer.from(value.slice(REASONING_PREFIX.length), "base64url")).toString("utf8")
+  } catch {
+    return undefined
+  }
+}
+
+function lastMessageIndex(messages, role) {
+  let index = -1
+  for (const [current, message] of messages.entries()) {
+    if (typeof message === "string") {
+      if (role === "user") index = current
+      continue
+    }
+    if (message?.role === role) index = current
+  }
+  return index
+}
+
+function readThinkDirective(text, onEffort) {
+  const match = /^\s*\/(no_think|think)(?=\s|$)[ \t]*/i.exec(text)
+  if (!match) return text
+  onEffort?.(match[1].toLowerCase() === "no_think" ? "none" : "high")
+  return text.slice(match[0].length)
+}
+
+function stripThinkControl(text) {
+  return String(text ?? "").replace(/^\s*\/(?:no_think|think)(?=$|\s|[.,;:!?])\s*/i, "")
+}
+
+function stripThinkFromParts(parts, onEffort) {
+  let applied = false
+  return parts.flatMap((part) => {
+    if (part.type !== "text" || applied) return [part]
+    applied = true
+    const text = readThinkDirective(part.text, onEffort)
+    return text ? [{ ...part, text }] : []
+  })
+}
+
+function outputText(value) {
+  if (typeof value === "string") return value
+  if (Array.isArray(value)) {
+    return value
+      .flatMap((part) => {
+        if (typeof part === "string") return [part]
+        if (part?.type === "input_text" || part?.type === "output_text" || part?.type === "text") {
+          return typeof part.text === "string" ? [part.text] : []
+        }
+        if (part?.type === "input_image" || part?.type === "image_url") return ["[image]"]
+        return []
+      })
+      .join("\n")
+  }
+  if (value && typeof value === "object") {
+    if (typeof value.text === "string") return value.text
+    if (typeof value.content === "string") return value.content
+    return JSON.stringify(value)
+  }
+  return String(value ?? "")
+}
+
+function normalizeChatEffort(value) {
+  if (value === undefined || value === null || value === false) return undefined
+  const normalized = String(value).trim().toLowerCase()
+  if (!normalized) return undefined
+  if (["none", "off", "disabled", "false", "no"].includes(normalized)) return "none"
+  if (["minimal", "minimum"].includes(normalized)) return "low"
+  if (["xhigh", "max", "ultra"].includes(normalized)) return "high"
+  if (["auto", "default", "model_default"].includes(normalized)) return undefined
+  if (["low", "medium", "high"].includes(normalized)) return normalized
+  return undefined
+}
+
+class ControlTextFilter {
+  constructor() {
+    this.buffer = ""
+    this.ready = false
+    this.trimLeading = false
+  }
+
+  push(text) {
+    if (typeof text !== "string" || text.length === 0) return ""
+    if (this.trimLeading) {
+      const trimmed = text.replace(/^\s+/, "")
+      if (!trimmed) return ""
+      this.trimLeading = false
+      text = trimmed
+    }
+    if (this.ready) return text
+    this.buffer += text
+    const trimmed = this.buffer.replace(/^\s+/, "")
+    const marker = /^(\/no_think|\/think)(?=$|\s|[.,;:!?])/i.exec(trimmed)
+    if (marker) {
+      this.ready = true
+      this.buffer = ""
+      const output = trimmed.slice(marker[0].length).replace(/^\s+/, "")
+      this.trimLeading = output.length === 0
+      return output
+    }
+    if (trimmed.startsWith("/") && trimmed.length < 12) return ""
+    this.ready = true
+    const output = this.buffer
+    this.buffer = ""
+    return output
+  }
+
+  flush() {
+    if (this.ready) return ""
+    this.ready = true
+    const output = this.buffer
+    this.buffer = ""
+    return output.replace(/^\s*\/(?:no_think|think)(?=$|\s|[.,;:!?])\s*/i, "")
+  }
+
+  reset() {
+    this.buffer = ""
+    this.ready = false
+    this.trimLeading = false
+  }
+}
+
 function rewriteResponsesBody(input) {
   const body = { ...input, stream: true }
   const tools = Array.isArray(input.tools) ? [...input.tools] : []
-  const hasRead = tools.some((tool) => tool?.type === "function" && tool?.name === "read")
+  const hasRead = tools.some((tool) => tool?.name === "read" || tool?.function?.name === "read")
   if (!hasRead) tools.push(RESPONSES_READ_TOOL)
   body.tools = tools
+  if (!hasRead && tools.length > 1) {
+    body.instructions = [
+      typeof input.instructions === "string" ? input.instructions : "",
+      "The `read` tool is a proxy compatibility marker. Do not call it; use the caller's tools for all work.",
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+  }
 
   if (!Array.isArray(input.tools) || input.tools.length === 0) {
     if (body.tool_choice === undefined) body.tool_choice = "none"
@@ -557,113 +973,162 @@ function rewriteResponsesBody(input) {
   return body
 }
 
+
 function responsesToChat(input) {
+  const registry = buildChatToolRegistry(input.tools)
   const messages = []
+  const callNames = new Map()
+  const source =
+    typeof input.input === "string"
+      ? [{ type: "message", role: "user", content: input.input }]
+      : Array.isArray(input.input)
+        ? input.input
+        : []
+  const lastUserIndex = lastMessageIndex(source, "user")
   let pendingReasoning = ""
   let hasPendingReasoning = false
+  let directiveEffort
 
-  const attachReasoning = (message) => {
+  const takeReasoning = () => {
     if (!hasPendingReasoning) return
-    message.reasoning_content = (message.reasoning_content ?? "") + pendingReasoning
+    const reasoning = { type: "reasoning", text: pendingReasoning }
     pendingReasoning = ""
     hasPendingReasoning = false
+    return reasoning
+  }
+  const attachReasoning = (message) => {
+    const reasoning = takeReasoning()
+    if (reasoning) message.reasoning_content = reasoning.text
+    return message
   }
   const flushReasoning = () => {
-    if (!hasPendingReasoning) return
-    messages.push({ role: "assistant", content: "", reasoning_content: pendingReasoning })
-    pendingReasoning = ""
-    hasPendingReasoning = false
-  }
-  const addReasoning = (text) => {
-    const previous = messages[messages.length - 1]
-    if (previous?.role === "assistant") {
-      previous.reasoning_content = (previous.reasoning_content ?? "") + text
-      return
-    }
-    pendingReasoning += text
-    hasPendingReasoning = true
+    const reasoning = takeReasoning()
+    if (reasoning) messages.push({ role: "assistant", content: "", reasoning_content: reasoning.text })
   }
 
-  if (typeof input.instructions === "string" && input.instructions.trim())
-    messages.push({ role: "system", content: input.instructions })
-
-  if (typeof input.input === "string") {
-    messages.push({ role: "user", content: input.input })
-  } else if (Array.isArray(input.input)) {
-    for (const item of input.input) {
-      if (typeof item === "string") {
-        flushReasoning()
-        messages.push({ role: "user", content: item })
-        continue
-      }
-      if (!item || typeof item !== "object") continue
-      if (item.type === "reasoning") {
-        const text = responsesReasoningText(item)
-        addReasoning(text)
-        if (text.length === 0) hasPendingReasoning = true
-        continue
-      }
-      if (item.type === "message") {
-        if (item.role === "assistant") {
-          const assistant = { role: "assistant", content: responsesContent(item.content) }
-          attachReasoning(assistant)
-          messages.push(assistant)
-        } else {
-          flushReasoning()
-          messages.push({
-            role: item.role === "developer" ? "system" : (item.role ?? "user"),
-            content: responsesContent(item.content),
-          })
-        }
-        continue
-      }
-      if (item.type === "function_call") {
-        const call = {
-          id: item.call_id ?? item.id ?? `call_${randomBytes(12).toString("hex")}`,
-          type: "function",
-          function: { name: item.name ?? "", arguments: item.arguments ?? "{}" },
-        }
-        const previous = messages[messages.length - 1]
-        if (previous?.role === "assistant" && Array.isArray(previous.tool_calls)) {
-          previous.tool_calls.push(call)
-          attachReasoning(previous)
-        } else {
-          const assistant = { role: "assistant", content: null, tool_calls: [call] }
-          attachReasoning(assistant)
-          messages.push(assistant)
-        }
-        continue
-      }
-      if (item.type === "function_call_output") {
-        flushReasoning()
-        messages.push({
-          role: "tool",
-          tool_call_id: item.call_id ?? "",
-          content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? ""),
-        })
-      }
-    }
-    flushReasoning()
+  if (typeof input.instructions === "string" && input.instructions.trim()) {
+    const text = readThinkDirective(input.instructions, (effort) => (directiveEffort = effort))
+    if (text) messages.push({ role: "system", content: text })
   }
+
+  for (const [itemIndex, item] of source.entries()) {
+    if (typeof item === "string") {
+      const text = itemIndex === lastUserIndex ? readThinkDirective(item, (effort) => (directiveEffort = effort)) : item
+      if (text) messages.push({ role: "user", content: text })
+      continue
+    }
+    if (!item || typeof item !== "object") continue
+
+    if (item.type === "reasoning") {
+      pendingReasoning += stripThinkControl(decodeReasoning(item.encrypted_content) ?? reasoningTextFromItem(item))
+      hasPendingReasoning = true
+      continue
+    }
+
+    if (item.type === "message") {
+      const role = item.role ?? "user"
+      const content = responsesContent(item.content)
+      if (role === "system" || role === "developer") {
+        const parts =
+          typeof content === "string"
+            ? readThinkDirective(content, (effort) => (directiveEffort = effort))
+            : stripThinkFromParts(content, (effort) => (directiveEffort = effort))
+        if (parts.length > 0) messages.push({ role: "system", content: parts })
+        continue
+      }
+      if (role === "assistant") {
+        messages.push(attachReasoning({ role: "assistant", content }))
+        continue
+      }
+      flushReasoning()
+      const parts =
+        itemIndex === lastUserIndex
+          ? typeof content === "string"
+            ? readThinkDirective(content, (effort) => (directiveEffort = effort))
+            : stripThinkFromParts(content, (effort) => (directiveEffort = effort))
+          : content
+      if (parts.length > 0) messages.push({ role: "user", content: parts })
+      continue
+    }
+
+    if (item.type === "function_call") {
+      const id = item.call_id ?? item.id ?? `call_${randomBytes(12).toString("hex")}`
+      const name = resolveToolName(registry, item.name ?? "", item.namespace)
+      callNames.set(id, name)
+      const call = {
+        id,
+        type: "function",
+        function: {
+          name,
+          arguments:
+            typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {}),
+        },
+      }
+      const previous = messages[messages.length - 1]
+      if (previous?.role === "assistant" && Array.isArray(previous.tool_calls)) {
+        previous.tool_calls.push(call)
+        attachReasoning(previous)
+      } else {
+        messages.push(attachReasoning({ role: "assistant", content: null, tool_calls: [call] }))
+      }
+      continue
+    }
+
+    if (item.type === "custom_tool_call") {
+      const id = item.call_id ?? item.id ?? `call_${randomBytes(12).toString("hex")}`
+      const name = resolveToolName(registry, item.name ?? "", item.namespace)
+      callNames.set(id, name)
+      const call = {
+        id,
+        type: "function",
+        function: {
+          name,
+          arguments: JSON.stringify({ input: customToolInput(item.input) }),
+        },
+      }
+      const previous = messages[messages.length - 1]
+      if (previous?.role === "assistant" && Array.isArray(previous.tool_calls)) {
+        previous.tool_calls.push(call)
+        attachReasoning(previous)
+      } else {
+        messages.push(attachReasoning({ role: "assistant", content: null, tool_calls: [call] }))
+      }
+      continue
+    }
+
+    if (
+      item.type === "function_call_output" ||
+      item.type === "custom_tool_call_output" ||
+      item.type === "tool_result"
+    ) {
+      flushReasoning()
+      const id = item.call_id ?? item.tool_use_id ?? item.id ?? ""
+      messages.push({
+        role: "tool",
+        tool_call_id: id,
+        name: callNames.get(id) ?? resolveToolName(registry, item.name ?? "", item.namespace),
+        content: outputText(item.output),
+      })
+    }
+  }
+  flushReasoning()
 
   const body = { model: input.model, messages, stream: true }
-  let tools = Array.isArray(input.tools) ? input.tools.filter((tool) => tool?.type === "function") : []
-  if (input.tool_choice?.type === "allowed_tools" && Array.isArray(input.tool_choice.tools)) {
-    const allowed = new Set(input.tool_choice.tools.map((tool) => tool.name))
-    tools = tools.filter((tool) => allowed.has(tool.name))
-  }
-  if (tools.length > 0) {
-    body.tools = tools.map((tool) => ({
+  let tools = registry.tools
+  const choice = input.tool_choice
+  if (choice === "none") body.tool_choice = "none"
+  else if (choice === "required") body.tool_choice = "required"
+  else if (choice && typeof choice === "object" && (choice.type === "function" || choice.type === "custom") && choice.name) {
+    body.tool_choice = {
       type: "function",
-      function: {
-        name: tool.name,
-        description: tool.description ?? "",
-        parameters: tool.parameters ?? { type: "object", properties: {} },
-        ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
-      },
-    }))
+      function: { name: resolveToolName(registry, choice.name, choice.namespace) },
+    }
+  } else if (choice?.type === "allowed_tools" && Array.isArray(choice.tools)) {
+    const allowed = new Set(choice.tools.map((tool) => resolveToolName(registry, tool.name, tool.namespace)))
+    tools = tools.filter((tool) => allowed.has(tool.function.name))
+    body.tool_choice = choice.mode ?? "auto"
   }
-  if (input.tool_choice !== undefined) body.tool_choice = responsesToolChoice(input.tool_choice)
+  if (tools.length > 0) body.tools = tools
   if (input.max_output_tokens !== undefined) body.max_completion_tokens = input.max_output_tokens
   for (const key of [
     "temperature",
@@ -678,24 +1143,11 @@ function responsesToChat(input) {
   ]) {
     if (input[key] !== undefined) body[key] = input[key]
   }
-  if (input.reasoning?.effort !== undefined) body.reasoning_effort = input.reasoning.effort
-  return body
+  const effort = normalizeChatEffort(input.reasoning?.effort ?? directiveEffort)
+  if (effort !== undefined) body.reasoning_effort = effort
+  return { body, registry }
 }
 
-function responsesReasoningText(item) {
-  const content = []
-  for (const part of Array.isArray(item.content) ? item.content : []) {
-    if (part?.type === "reasoning_text" && typeof part.text === "string") content.push(part.text)
-  }
-  if (content.length > 0) return content.join("")
-
-  const summary = []
-  for (const part of Array.isArray(item.summary) ? item.summary : []) {
-    if (part?.type === "summary_text" && typeof part.text === "string") summary.push(part.text)
-  }
-  if (summary.length > 0) return summary.join("")
-  return typeof item.text === "string" ? item.text : ""
-}
 
 function responsesContent(content) {
   if (typeof content === "string") return content
@@ -719,19 +1171,18 @@ function responsesContent(content) {
   return parts
 }
 
-function responsesToolChoice(choice) {
-  if (typeof choice === "string") return choice
-  if (choice?.type === "function" && choice.name) return { type: "function", function: { name: choice.name } }
-  if (choice?.type === "allowed_tools") return choice.mode ?? "auto"
-  return "auto"
-}
 
 function anthropicToChat(input) {
+  const registry = buildChatToolRegistry(input.tools)
   const messages = []
-  const system = anthropicText(input.system)
+  const toolNames = new Map()
+  const source = Array.isArray(input.messages) ? input.messages : []
+  const lastUserIndex = lastMessageIndex(source, "user")
+  let directiveEffort
+  const system = readThinkDirective(anthropicText(input.system), (effort) => (directiveEffort = effort))
   if (system) messages.push({ role: "system", content: system })
 
-  for (const message of Array.isArray(input.messages) ? input.messages : []) {
+  for (const [messageIndex, message] of source.entries()) {
     if (!message || typeof message !== "object") continue
     if (message.role === "assistant") {
       const text = []
@@ -742,15 +1193,18 @@ function anthropicToChat(input) {
         if (block.type === "text" && typeof block.text === "string") text.push(block.text)
         if (block.type === "thinking") {
           hasThinking = true
-          if (typeof block.thinking === "string") reasoning.push(block.thinking)
+          if (typeof block.thinking === "string") reasoning.push(stripThinkControl(block.thinking))
         }
         if (block.type === "redacted_thinking") hasThinking = true
         if (block.type === "tool_use") {
+          const id = block.id ?? `call_${randomBytes(12).toString("hex")}`
+          const name = resolveToolName(registry, block.name ?? "")
+          toolNames.set(id, name)
           toolCalls.push({
-            id: block.id ?? `call_${randomBytes(12).toString("hex")}`,
+            id,
             type: "function",
             function: {
-              name: block.name ?? "",
+              name,
               arguments: typeof block.input === "string" ? block.input : JSON.stringify(block.input ?? {}),
             },
           })
@@ -768,6 +1222,7 @@ function anthropicToChat(input) {
     }
 
     const parts = []
+    let directiveApplied = false
     const flush = () => {
       if (parts.length === 0) return
       messages.push({ role: "user", content: collapseChatContent(parts) })
@@ -779,12 +1234,18 @@ function anthropicToChat(input) {
         messages.push({
           role: "tool",
           tool_call_id: block.tool_use_id ?? "",
+          name: toolNames.get(block.tool_use_id) ?? "unknown",
           content: anthropicText(block.content),
         })
         continue
       }
       if (block.type === "text" && typeof block.text === "string") {
-        parts.push({ type: "text", text: block.text })
+        const value =
+          messageIndex === lastUserIndex && !directiveApplied
+            ? readThinkDirective(block.text, (effort) => (directiveEffort = effort))
+            : block.text
+        directiveApplied = true
+        if (value) parts.push({ type: "text", text: value })
         continue
       }
       if (block.type === "image") {
@@ -796,17 +1257,17 @@ function anthropicToChat(input) {
   }
 
   const body = { model: input.model, messages, stream: true }
-  if (Array.isArray(input.tools) && input.tools.length > 0) {
-    body.tools = input.tools.map((tool) => ({
-      type: "function",
-      function: {
-        name: tool.name,
-        description: tool.description ?? "",
-        parameters: tool.input_schema ?? { type: "object", properties: {} },
-      },
-    }))
+  if (registry.tools.length > 0) body.tools = registry.tools
+  if (input.tool_choice !== undefined) {
+    if (input.tool_choice?.type === "tool" && input.tool_choice.name) {
+      body.tool_choice = {
+        type: "function",
+        function: { name: resolveToolName(registry, input.tool_choice.name) },
+      }
+    } else {
+      body.tool_choice = anthropicToolChoice(input.tool_choice)
+    }
   }
-  if (input.tool_choice !== undefined) body.tool_choice = anthropicToolChoice(input.tool_choice)
   if (input.tool_choice?.disable_parallel_tool_use !== undefined) {
     body.parallel_tool_calls = !input.tool_choice.disable_parallel_tool_use
   }
@@ -815,7 +1276,11 @@ function anthropicToChat(input) {
     if (input[key] !== undefined) body[key] = input[key]
   }
   if (Array.isArray(input.stop_sequences) && input.stop_sequences.length > 0) body.stop = input.stop_sequences
-  return body
+  const effort = normalizeChatEffort(
+    directiveEffort ?? (input.thinking?.type === "enabled" ? "high" : input.thinking?.type === "disabled" ? "none" : undefined),
+  )
+  if (effort !== undefined) body.reasoning_effort = effort
+  return { body, registry }
 }
 
 function anthropicBlocks(content) {
@@ -862,34 +1327,54 @@ function anthropicToolChoice(choice) {
   return "auto"
 }
 
-function chatToResponse(chat, originalModel) {
+function chatToResponse(chat, originalModel, registry, injectedRead = false) {
   const choice = chat.choices?.[0]
   const message = choice?.message ?? {}
   const output = []
-  if (typeof message.reasoning_content === "string" && message.reasoning_content.length > 0) {
+  const reasoning = stripThinkControl(message.reasoning_content ?? "")
+  if (reasoning.length > 0) {
     output.push({
       type: "reasoning",
       id: `rs_${randomBytes(12).toString("hex")}`,
-      summary: [{ type: "summary_text", text: message.reasoning_content }],
+      summary: [{ type: "summary_text", text: reasoning }],
+      encrypted_content: encodeReasoning(reasoning),
     })
   }
-  if (typeof message.content === "string" && message.content.length > 0) {
+  const content = stripThinkControl(message.content ?? "")
+  if (content.length > 0) {
     output.push({
       type: "message",
       id: `msg_${randomBytes(12).toString("hex")}`,
       status: "completed",
       role: "assistant",
-      content: [{ type: "output_text", text: message.content, annotations: [] }],
+      content: [{ type: "output_text", text: content, annotations: [] }],
     })
   }
   for (const call of message.tool_calls ?? []) {
+    const name = call.function?.name ?? ""
+    if (injectedRead && name === "read" && !registry?.byName.has("read")) continue
+    const descriptor = registry?.byName.get(name)
+    const args = call.function?.arguments ?? "{}"
+    if (descriptor?.kind === "custom") {
+      output.push({
+        type: "custom_tool_call",
+        id: `ctc_${randomBytes(12).toString("hex")}`,
+        status: "completed",
+        call_id: call.id ?? `call_${randomBytes(12).toString("hex")}`,
+        name: descriptor.name,
+        ...(descriptor.namespace ? { namespace: descriptor.namespace } : {}),
+        input: customToolInput(parseToolInput(args)),
+      })
+      continue
+    }
     output.push({
       type: "function_call",
       id: `fc_${randomBytes(12).toString("hex")}`,
       status: "completed",
       call_id: call.id ?? `call_${randomBytes(12).toString("hex")}`,
-      name: call.function?.name ?? "",
-      arguments: call.function?.arguments ?? "{}",
+      name: descriptor?.name ?? name,
+      ...(descriptor?.namespace ? { namespace: descriptor.namespace } : {}),
+      arguments: typeof args === "string" ? args : JSON.stringify(args),
     })
   }
 
@@ -923,24 +1408,33 @@ function chatToUsage(usage) {
   }
 }
 
-function chatToAnthropic(chat, originalModel) {
+function chatToAnthropic(chat, originalModel, registry, injectedRead = false) {
   const choice = chat.choices?.[0]
   const message = choice?.message ?? {}
   const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : []
   const content = []
+  const reasoning = stripThinkControl(message.reasoning_content ?? "")
 
-  if (typeof message.reasoning_content === "string" && message.reasoning_content.length > 0) {
-    content.push({ type: "thinking", thinking: message.reasoning_content, signature: "" })
+  if (reasoning.length > 0) {
+    content.push({ type: "thinking", thinking: reasoning, signature: encodeReasoning(reasoning) ?? "" })
   }
-  if (typeof message.content === "string" && message.content.length > 0) {
-    content.push({ type: "text", text: message.content })
+  const text = stripThinkControl(message.content ?? "")
+  if (text.length > 0) {
+    content.push({ type: "text", text })
   }
   for (const call of toolCalls) {
+    const name = call.function?.name ?? ""
+    if (injectedRead && name === "read" && !registry?.byName.has("read")) continue
+    const descriptor = registry?.byName.get(name)
+    const args = call.function?.arguments ?? "{}"
     content.push({
       type: "tool_use",
       id: call.id ?? `toolu_${randomBytes(12).toString("hex")}`,
-      name: call.function?.name ?? "",
-      input: parseToolInput(call.function?.arguments),
+      name: descriptor?.name ?? name,
+      input:
+        descriptor?.kind === "custom"
+          ? { input: customToolInput(parseToolInput(args)) }
+          : parseToolInput(args),
     })
   }
   if (content.length === 0) content.push({ type: "text", text: "" })
@@ -958,6 +1452,7 @@ function chatToAnthropic(chat, originalModel) {
 }
 
 function parseToolInput(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value
   if (typeof value !== "string" || value.length === 0) return {}
   try {
     const parsed = JSON.parse(value)
@@ -984,13 +1479,16 @@ function anthropicStopReason(reason, hasToolCalls) {
   return "end_turn"
 }
 
-async function translateChatToAnthropicStream(upstream, response, originalModel) {
+async function translateChatToAnthropicStream(upstream, response, originalModel, registry, injectedRead = false) {
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
+  const textFilter = new ControlTextFilter()
+  const reasoningFilter = new ControlTextFilter()
   const state = {
     messageId: `msg_${randomBytes(12).toString("hex")}`,
     model: originalModel ?? "unknown",
     nextIndex: 0,
+    blocks: [],
     reasoning: undefined,
     text: undefined,
     tools: new Map(),
@@ -1001,8 +1499,8 @@ async function translateChatToAnthropicStream(upstream, response, originalModel)
   let buffer = ""
 
   const emit = (type, data) => {
-    response.write(`event: ${type}\n`)
-    response.write(`data: ${JSON.stringify({ type, ...data })}\n\n`)
+    if (response.writableEnded || response.destroyed) return
+    response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
   }
 
   emit("message_start", {
@@ -1021,40 +1519,63 @@ async function translateChatToAnthropicStream(upstream, response, originalModel)
 
   const ensureReasoning = () => {
     if (state.reasoning) return state.reasoning
-    state.reasoning = { index: state.nextIndex++, text: "" }
+    state.reasoning = { kind: "reasoning", index: state.nextIndex++, text: "" }
+    state.blocks.push(state.reasoning)
     emit("content_block_start", {
       index: state.reasoning.index,
       content_block: { type: "thinking", thinking: "" },
     })
     return state.reasoning
   }
-
   const ensureText = () => {
     if (state.text) return state.text
-    state.text = { index: state.nextIndex++, text: "" }
-    emit("content_block_start", {
-      index: state.text.index,
-      content_block: { type: "text", text: "" },
-    })
+    state.text = { kind: "text", index: state.nextIndex++, text: "" }
+    state.blocks.push(state.text)
+    emit("content_block_start", { index: state.text.index, content_block: { type: "text", text: "" } })
     return state.text
   }
-
   const ensureTool = (call) => {
     const key = call.index ?? 0
     const existing = state.tools.get(key)
     if (existing) return existing
+    const name = call.function?.name ?? ""
+    if (injectedRead && name === "read" && !registry?.byName.has("read")) {
+      const skipped = { skip: true }
+      state.tools.set(key, skipped)
+      return skipped
+    }
+    const descriptor = registry?.byName.get(name)
     const tool = {
+      kind: "tool",
       index: state.nextIndex++,
       id: call.id ?? `toolu_${randomBytes(12).toString("hex")}`,
-      name: call.function?.name ?? "",
+      name: descriptor?.name ?? name,
       arguments: "",
     }
     state.tools.set(key, tool)
+    state.blocks.push(tool)
     emit("content_block_start", {
       index: tool.index,
       content_block: { type: "tool_use", id: tool.id, name: tool.name, input: {} },
     })
     return tool
+  }
+  const flushFilters = () => {
+    const reasoningText = reasoningFilter.flush()
+    if (reasoningText) {
+      const reasoning = ensureReasoning()
+      reasoning.text += reasoningText
+      emit("content_block_delta", {
+        index: reasoning.index,
+        delta: { type: "thinking_delta", thinking: reasoningText },
+      })
+    }
+    const text = textFilter.flush()
+    if (text) {
+      const block = ensureText()
+      block.text += text
+      emit("content_block_delta", { index: block.index, delta: { type: "text_delta", text } })
+    }
   }
 
   const consume = (line) => {
@@ -1073,24 +1594,31 @@ async function translateChatToAnthropicStream(upstream, response, originalModel)
       if (choice.finish_reason) state.finishReason = choice.finish_reason
       const delta = choice.delta ?? {}
       if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
-        const reasoning = ensureReasoning()
-        reasoning.text += delta.reasoning_content
-        emit("content_block_delta", {
-          index: reasoning.index,
-          delta: { type: "thinking_delta", thinking: delta.reasoning_content },
-        })
+        const value = reasoningFilter.push(delta.reasoning_content)
+        if (value) {
+          const reasoning = ensureReasoning()
+          reasoning.text += value
+          emit("content_block_delta", {
+            index: reasoning.index,
+            delta: { type: "thinking_delta", thinking: value },
+          })
+        }
       }
       if (typeof delta.content === "string" && delta.content.length > 0) {
-        const text = ensureText()
-        text.text += delta.content
-        emit("content_block_delta", {
-          index: text.index,
-          delta: { type: "text_delta", text: delta.content },
-        })
+        const value = textFilter.push(delta.content)
+        if (value) {
+          const text = ensureText()
+          text.text += value
+          emit("content_block_delta", { index: text.index, delta: { type: "text_delta", text: value } })
+        }
       }
-      for (const call of delta.tool_calls ?? []) {
+      const calls = delta.tool_calls ?? []
+      if (calls.length > 0) flushFilters()
+      for (const call of calls) {
         const tool = ensureTool(call)
-        if (call.function?.name) tool.name = call.function.name
+        if (tool.skip) continue
+        if (call.id) tool.id = call.id
+        if (call.function?.name && !tool.name) tool.name = call.function.name
         if (call.function?.arguments) {
           tool.arguments += call.function.arguments
           emit("content_block_delta", {
@@ -1098,6 +1626,12 @@ async function translateChatToAnthropicStream(upstream, response, originalModel)
             delta: { type: "input_json_delta", partial_json: call.function.arguments },
           })
         }
+      }
+      if ((delta.tool_calls ?? []).length > 0) {
+        state.text = undefined
+        state.reasoning = undefined
+        textFilter.reset()
+        reasoningFilter.reset()
       }
     }
   }
@@ -1120,21 +1654,19 @@ async function translateChatToAnthropicStream(upstream, response, originalModel)
     return
   }
 
-  const blocks = []
-  if (state.reasoning) blocks.push({ index: state.reasoning.index, type: "reasoning" })
-  if (state.text) blocks.push({ index: state.text.index, type: "text" })
-  for (const tool of state.tools.values()) blocks.push({ index: tool.index, type: "tool" })
-  blocks.sort((left, right) => left.index - right.index)
+  flushFilters()
 
+  const blocks = [...state.blocks]
+  blocks.sort((left, right) => left.index - right.index)
   if (blocks.length === 0) {
     emit("content_block_start", { index: 0, content_block: { type: "text", text: "" } })
     emit("content_block_stop", { index: 0 })
   } else {
     for (const block of blocks) {
-      if (block.type === "reasoning") {
+      if (block.kind === "reasoning") {
         emit("content_block_delta", {
           index: block.index,
-          delta: { type: "signature_delta", signature: "" },
+          delta: { type: "signature_delta", signature: encodeReasoning(block.text) ?? "" },
         })
       }
       emit("content_block_stop", { index: block.index })
@@ -1152,15 +1684,18 @@ async function translateChatToAnthropicStream(upstream, response, originalModel)
   response.end()
 }
 
-async function translateChatStream(upstream, response, originalModel) {
+async function translateChatStream(upstream, response, originalModel, registry, injectedRead = false) {
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
+  const textFilter = new ControlTextFilter()
+  const reasoningFilter = new ControlTextFilter()
   const state = {
     responseId: `resp_${randomBytes(12).toString("hex")}`,
     createdAt: Math.floor(Date.now() / 1000),
     model: originalModel ?? "unknown",
     sequence: 0,
     nextIndex: 0,
+    blocks: [],
     reasoning: undefined,
     message: undefined,
     tools: new Map(),
@@ -1181,56 +1716,103 @@ async function translateChatStream(upstream, response, originalModel) {
     error: null,
     incomplete_details: status === "incomplete" ? { reason: "max_output_tokens" } : null,
   })
-
   const emit = (type, data) => {
-    response.write(`event: ${type}\n`)
-    response.write(`data: ${JSON.stringify({ type, sequence_number: state.sequence++, ...data })}\n\n`)
+    if (response.writableEnded || response.destroyed) return
+    response.write(`event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: state.sequence++, ...data })}\n\n`)
   }
 
   const ensureReasoning = () => {
     if (state.reasoning) return state.reasoning
-    state.reasoning = { id: `rs_${randomBytes(12).toString("hex")}`, index: state.nextIndex++, text: "" }
+    state.reasoning = { kind: "reasoning", id: `rs_${randomBytes(12).toString("hex")}`, index: state.nextIndex++, text: "" }
+    state.blocks.push(state.reasoning)
     emit("response.output_item.added", {
       output_index: state.reasoning.index,
       item: { type: "reasoning", id: state.reasoning.id, summary: [] },
     })
     return state.reasoning
   }
-
   const ensureMessage = () => {
     if (state.message) return state.message
-    state.message = { id: `msg_${randomBytes(12).toString("hex")}`, index: state.nextIndex++, text: "" }
+    state.message = { kind: "message", id: `msg_${randomBytes(12).toString("hex")}`, index: state.nextIndex++, text: "" }
+    state.blocks.push(state.message)
     emit("response.output_item.added", {
       output_index: state.message.index,
       item: { type: "message", id: state.message.id, status: "in_progress", role: "assistant", content: [] },
     })
     return state.message
   }
-
   const ensureTool = (call) => {
     const index = call.index ?? 0
     const existing = state.tools.get(index)
     if (existing) return existing
+    const name = call.function?.name ?? ""
+    if (injectedRead && name === "read" && !registry?.byName.has("read")) {
+      const skipped = { skip: true, arguments: "" }
+      state.tools.set(index, skipped)
+      return skipped
+    }
+    const descriptor = registry?.byName.get(name)
+    const custom = descriptor?.kind === "custom"
     const tool = {
-      id: `fc_${randomBytes(12).toString("hex")}`,
+      kind: custom ? "custom" : "function",
+      custom,
+      id: custom ? `ctc_${randomBytes(12).toString("hex")}` : `fc_${randomBytes(12).toString("hex")}`,
       index: state.nextIndex++,
       callID: call.id ?? `call_${randomBytes(12).toString("hex")}`,
-      name: call.function?.name ?? "",
+      name: descriptor?.name ?? name,
+      namespace: descriptor?.namespace ?? null,
       arguments: "",
+      input: "",
     }
     state.tools.set(index, tool)
+    state.blocks.push(tool)
     emit("response.output_item.added", {
       output_index: tool.index,
-      item: {
-        type: "function_call",
-        id: tool.id,
-        call_id: tool.callID,
-        name: tool.name,
-        arguments: "",
-        status: "in_progress",
-      },
+      item: custom
+        ? {
+            type: "custom_tool_call",
+            id: tool.id,
+            call_id: tool.callID,
+            name: tool.name,
+            ...(tool.namespace ? { namespace: tool.namespace } : {}),
+            input: "",
+            status: "in_progress",
+          }
+        : {
+            type: "function_call",
+            id: tool.id,
+            call_id: tool.callID,
+            name: tool.name,
+            ...(tool.namespace ? { namespace: tool.namespace } : {}),
+            arguments: "",
+            status: "in_progress",
+          },
     })
     return tool
+  }
+  const flushFilters = () => {
+    const reasoningText = reasoningFilter.flush()
+    if (reasoningText) {
+      const reasoning = ensureReasoning()
+      reasoning.text += reasoningText
+      emit("response.reasoning_summary_text.delta", {
+        item_id: reasoning.id,
+        output_index: reasoning.index,
+        summary_index: 0,
+        delta: reasoningText,
+      })
+    }
+    const text = textFilter.flush()
+    if (text) {
+      const message = ensureMessage()
+      message.text += text
+      emit("response.output_text.delta", {
+        item_id: message.id,
+        output_index: message.index,
+        content_index: 0,
+        delta: text,
+      })
+    }
   }
 
   emit("response.created", { response: responseObject("in_progress", []) })
@@ -1252,37 +1834,56 @@ async function translateChatStream(upstream, response, originalModel) {
       if (choice.finish_reason) state.finishReason = choice.finish_reason
       const delta = choice.delta ?? {}
       if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
-        const reasoning = ensureReasoning()
-        reasoning.text += delta.reasoning_content
-        emit("response.reasoning_summary_text.delta", {
-          item_id: reasoning.id,
-          output_index: reasoning.index,
-          summary_index: 0,
-          delta: delta.reasoning_content,
-        })
-      }
-      if (typeof delta.content === "string" && delta.content.length > 0) {
-        const message = ensureMessage()
-        message.text += delta.content
-        emit("response.output_text.delta", {
-          item_id: message.id,
-          output_index: message.index,
-          content_index: 0,
-          delta: delta.content,
-        })
-      }
-      for (const call of delta.tool_calls ?? []) {
-        const tool = ensureTool(call)
-        if (call.id) tool.callID = call.id
-        if (call.function?.name) tool.name = call.function.name
-        if (call.function?.arguments) {
-          tool.arguments += call.function.arguments
-          emit("response.function_call_arguments.delta", {
-            item_id: tool.id,
-            output_index: tool.index,
-            delta: call.function.arguments,
+        const value = reasoningFilter.push(delta.reasoning_content)
+        if (value) {
+          const reasoning = ensureReasoning()
+          reasoning.text += value
+          emit("response.reasoning_summary_text.delta", {
+            item_id: reasoning.id,
+            output_index: reasoning.index,
+            summary_index: 0,
+            delta: value,
           })
         }
+      }
+      if (typeof delta.content === "string" && delta.content.length > 0) {
+        const value = textFilter.push(delta.content)
+        if (value) {
+          const message = ensureMessage()
+          message.text += value
+          emit("response.output_text.delta", {
+            item_id: message.id,
+            output_index: message.index,
+            content_index: 0,
+            delta: value,
+          })
+        }
+      }
+      const calls = delta.tool_calls ?? []
+      if (calls.length > 0) flushFilters()
+      for (const call of calls) {
+        const tool = ensureTool(call)
+        if (tool.skip) continue
+        if (call.id) tool.callID = call.id
+        if (call.function?.name && !tool.name) tool.name = call.function.name
+        if (call.function?.arguments) {
+          tool.arguments += call.function.arguments
+          if (tool.custom) {
+            tool.input = customToolInput(parseToolInput(tool.arguments))
+          } else {
+            emit("response.function_call_arguments.delta", {
+              item_id: tool.id,
+              output_index: tool.index,
+              delta: call.function.arguments,
+            })
+          }
+        }
+      }
+      if (calls.length > 0) {
+        state.message = undefined
+        state.reasoning = undefined
+        textFilter.reset()
+        reasoningFilter.reset()
       }
     }
   }
@@ -1305,67 +1906,87 @@ async function translateChatStream(upstream, response, originalModel) {
     return
   }
 
-  const items = []
-  if (state.reasoning) {
-    const item = {
-      type: "reasoning",
-      id: state.reasoning.id,
-      summary: [{ type: "summary_text", text: state.reasoning.text }],
+  flushFilters()
+
+  for (const block of state.blocks) {
+    if (!block.custom) continue
+    block.input = customToolInput(parseToolInput(block.arguments))
+    if (block.input) {
+      emit("response.custom_tool_call_input.delta", {
+        item_id: block.id,
+        output_index: block.index,
+        delta: block.input,
+      })
     }
-    items.push({
-      index: state.reasoning.index,
-      item,
-      done: {
-        type: "response.reasoning_summary_text.done",
-        data: {
-          item_id: state.reasoning.id,
-          output_index: state.reasoning.index,
-          summary_index: 0,
-          text: state.reasoning.text,
-        },
-      },
-    })
   }
-  if (state.message) {
-    const item = {
-      type: "message",
-      id: state.message.id,
-      status: "completed",
-      role: "assistant",
-      content: [{ type: "output_text", text: state.message.text, annotations: [] }],
-    }
-    items.push({
-      index: state.message.index,
-      item,
-      done: {
-        type: "response.output_text.done",
-        data: {
-          item_id: state.message.id,
-          output_index: state.message.index,
-          content_index: 0,
-          text: state.message.text,
+
+  const items = state.blocks.map((block) => {
+    if (block.kind === "reasoning") {
+      return {
+        index: block.index,
+        item: {
+          type: "reasoning",
+          id: block.id,
+          summary: [{ type: "summary_text", text: block.text }],
+          encrypted_content: encodeReasoning(block.text),
         },
-      },
-    })
-  }
-  for (const tool of state.tools.values()) {
-    const item = {
-      type: "function_call",
-      id: tool.id,
-      status: "completed",
-      call_id: tool.callID,
-      name: tool.name,
-      arguments: tool.arguments,
+        done: {
+          type: "response.reasoning_summary_text.done",
+          data: { item_id: block.id, output_index: block.index, summary_index: 0, text: block.text },
+        },
+      }
     }
-    items.push({
-      index: tool.index,
-      item,
+    if (block.kind === "message") {
+      return {
+        index: block.index,
+        item: {
+          type: "message",
+          id: block.id,
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: block.text, annotations: [] }],
+        },
+        done: {
+          type: "response.output_text.done",
+          data: { item_id: block.id, output_index: block.index, content_index: 0, text: block.text },
+        },
+      }
+    }
+    if (block.custom) {
+      return {
+        index: block.index,
+        item: {
+          type: "custom_tool_call",
+          id: block.id,
+          status: "completed",
+          call_id: block.callID,
+          name: block.name,
+          ...(block.namespace ? { namespace: block.namespace } : {}),
+          input: block.input,
+        },
+        done: {
+          type: "response.custom_tool_call_input.done",
+          data: { item_id: block.id, output_index: block.index, input: block.input },
+        },
+      }
+    }
+    return {
+      index: block.index,
+      item: {
+        type: "function_call",
+        id: block.id,
+        status: "completed",
+        call_id: block.callID,
+        name: block.name,
+        ...(block.namespace ? { namespace: block.namespace } : {}),
+        arguments: block.arguments,
+      },
       done: {
         type: "response.function_call_arguments.done",
-        data: { item_id: tool.id, output_index: tool.index, arguments: tool.arguments },
+        data: { item_id: block.id, output_index: block.index, arguments: block.arguments },
       },
-    })
-  }
+    }
+  })
   items.sort((left, right) => left.index - right.index)
   for (const item of items) {
     emit(item.done.type, item.done.data)
@@ -1396,8 +2017,8 @@ function isModelProtocolUnsupported(text) {
   return text.includes("ModelProtocolUnsupported") || text.includes("does not support this protocol")
 }
 
-function buildAnthropicHeaders(incoming, wantsStream) {
-  const headers = buildHeaders(incoming, wantsStream)
+function buildAnthropicHeaders(incoming, wantsStream, session) {
+  const headers = buildHeaders(incoming, wantsStream, session)
   const key = upstreamKey(incoming)
   headers.set("authorization", `Bearer ${key}`)
   headers.set("x-api-key", key)
@@ -1407,7 +2028,7 @@ function buildAnthropicHeaders(incoming, wantsStream) {
   return headers
 }
 
-function buildHeaders(incoming, wantsStream) {
+function buildHeaders(incoming, wantsStream, session = SESSION) {
   const trace = randomBytes(16).toString("hex")
   const span = randomBytes(8).toString("hex")
   const parent = randomBytes(8).toString("hex")
@@ -1420,19 +2041,21 @@ function buildHeaders(incoming, wantsStream) {
     "user-agent": USER_AGENT,
     "x-opencode-client": "cli",
     "x-opencode-project": PROJECT,
-    "x-opencode-session": SESSION,
-    "x-opencode-session-id": SESSION,
-    "x-session-affinity": SESSION,
-    "x-session-id": SESSION,
+    "x-opencode-session": session,
+    "x-opencode-session-id": session,
+    "x-session-affinity": session,
+    "x-session-id": session,
     authorization,
     traceparent: `00-${trace}-${span}-01`,
     b3: `${trace}-${span}-1-${parent}`,
   })
 }
 
-async function aggregate(upstream) {
+async function aggregate(upstream, injectedRead = false) {
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
+  const textFilter = new ControlTextFilter()
+  const reasoningFilter = new ControlTextFilter()
   const result = {
     id: "",
     created: 0,
@@ -1451,15 +2074,30 @@ async function aggregate(upstream) {
     if (!data || data === "[DONE]") return
     const chunk = parseBody(data)
     if (!chunk) return
+    if (chunk.error) {
+      const message =
+        (typeof chunk.error === "string" ? chunk.error : chunk.error.message) ?? "Upstream stream error"
+      const error = new Error(message)
+      error.status = chunk.error.statusCode ?? chunk.error.status ?? 502
+      throw error
+    }
     if (chunk.id) result.id = chunk.id
     if (chunk.created) result.created = chunk.created
     if (chunk.model) result.model = chunk.model
     if (chunk.usage) result.usage = chunk.usage
     for (const choice of chunk.choices ?? []) {
       const delta = choice.delta ?? {}
-      if (typeof delta.content === "string") result.content += delta.content
-      if (typeof delta.reasoning_content === "string") result.reasoning += delta.reasoning_content
-      if (Array.isArray(delta.tool_calls)) mergeToolCalls(result.toolCalls, delta.tool_calls)
+      if (typeof delta.content === "string") result.content += textFilter.push(delta.content)
+      if (typeof delta.reasoning_content === "string") {
+        result.reasoning += reasoningFilter.push(delta.reasoning_content)
+      }
+      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+        result.content += textFilter.flush()
+        result.reasoning += reasoningFilter.flush()
+        textFilter.reset()
+        reasoningFilter.reset()
+        mergeToolCalls(result.toolCalls, delta.tool_calls)
+      }
       if (choice.finish_reason) result.finishReason = choice.finish_reason
     }
   }
@@ -1477,12 +2115,15 @@ async function aggregate(upstream) {
   }
   buffer += decoder.decode()
   if (buffer.trim()) consume(buffer.trim())
+  result.content += textFilter.flush()
+  result.reasoning += reasoningFilter.flush()
 
   const message = { role: "assistant", content: result.content }
   if (result.reasoning) message.reasoning_content = result.reasoning
   if (result.toolCalls.size > 0) {
     message.tool_calls = Array.from(result.toolCalls.values())
       .sort((left, right) => left.index - right.index)
+      .filter((call) => !(injectedRead && call.function?.name === "read"))
       .map(({ index, ...call }) => call)
   }
 
@@ -1628,12 +2269,112 @@ async function pipeBody(upstream, response) {
   response.end()
 }
 
+async function pipeChatStream(upstream, response, injectedRead = false) {
+  if (!upstream.body) {
+    response.end()
+    return
+  }
+  const reader = upstream.body.getReader()
+  const decoder = new TextDecoder()
+  const textFilter = new ControlTextFilter()
+  const reasoningFilter = new ControlTextFilter()
+  const meta = {
+    id: `chatcmpl-${randomBytes(12).toString("hex")}`,
+    created: Math.floor(Date.now() / 1000),
+    model: "unknown",
+  }
+  let buffer = ""
+  let done = false
+
+  const write = (value) => {
+    if (response.writableEnded || response.destroyed) return
+    response.write(`data: ${JSON.stringify(value)}\n\n`)
+  }
+  const flushFilters = () => {
+    const delta = {}
+    const text = textFilter.flush()
+    if (text) delta.content = text
+    const reasoning = reasoningFilter.flush()
+    if (reasoning) delta.reasoning_content = reasoning
+    if (Object.keys(delta).length === 0) return
+    write({
+      id: meta.id,
+      object: "chat.completion.chunk",
+      created: meta.created,
+      model: meta.model,
+      choices: [{ index: 0, delta, finish_reason: null }],
+    })
+  }
+  const consume = (line) => {
+    if (done || !line.startsWith("data:")) return
+    const data = line.slice(5).trim()
+    if (data === "[DONE]") {
+      flushFilters()
+      done = true
+      if (!response.writableEnded && !response.destroyed) response.write("data: [DONE]\n\n")
+      return
+    }
+    const chunk = parseBody(data)
+    if (!chunk) return
+    if (chunk.id) meta.id = chunk.id
+    if (chunk.created) meta.created = chunk.created
+    if (chunk.model) meta.model = chunk.model
+    const hasFinish = (chunk.choices ?? []).some((choice) => choice?.finish_reason)
+    let hasToolCalls = false
+    for (const choice of chunk.choices ?? []) {
+      const delta = choice?.delta
+      if (!delta) continue
+      if (typeof delta.content === "string") {
+        const text = textFilter.push(delta.content)
+        if (text) delta.content = text
+        else delete delta.content
+      }
+      if (typeof delta.reasoning_content === "string") {
+        const reasoning = reasoningFilter.push(delta.reasoning_content)
+        if (reasoning) delta.reasoning_content = reasoning
+        else delete delta.reasoning_content
+      }
+      if (injectedRead && Array.isArray(delta.tool_calls)) {
+        delta.tool_calls = delta.tool_calls.filter((call) => call.function?.name !== "read")
+      }
+      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) hasToolCalls = true
+    }
+    if (hasToolCalls) {
+      flushFilters()
+      textFilter.reset()
+      reasoningFilter.reset()
+    }
+    if (hasFinish) flushFilters()
+    write(chunk)
+  }
+
+  while (!done) {
+    const { done: finished, value } = await reader.read()
+    if (finished) break
+    buffer += decoder.decode(value, { stream: true })
+    let newline = buffer.indexOf("\n")
+    while (newline !== -1) {
+      consume(buffer.slice(0, newline).replace(/\r$/, ""))
+      buffer = buffer.slice(newline + 1)
+      newline = buffer.indexOf("\n")
+    }
+  }
+  buffer += decoder.decode()
+  if (buffer.trim()) consume(buffer.trim())
+  if (!done) flushFilters()
+  response.end()
+}
+
 async function readBody(request) {
   const chunks = []
   let size = 0
   for await (const chunk of request) {
     size += chunk.length
-    if (size > MAX_BODY_BYTES) throw new Error("request body too large")
+    if (size > MAX_BODY_BYTES) {
+      const error = new Error("request body too large")
+      error.status = 413
+      throw error
+    }
     chunks.push(chunk)
   }
   return Buffer.concat(chunks).toString("utf8")
@@ -1668,7 +2409,28 @@ function upstreamKey(incoming) {
   return "public"
 }
 
-function createSessionID() {
+function requestSession(headers, body) {
+  if (FIXED_SESSION) return FIXED_SESSION
+  const values = [
+    body?.prompt_cache_key,
+    body?.client_metadata?.session_id,
+    headers["session-id"],
+    headers["thread-id"],
+    headers["x-opencode-session"],
+    headers["x-session-id"],
+    headers["x-client-request-id"],
+  ]
+  const seed = values.find((value) => typeof value === "string" && value.length > 0)
+  return seed ? createSessionID(seed) : SESSION
+}
+
+function createSessionID(seed) {
+  if (seed) {
+    const hash = createHash("sha256").update(String(seed)).digest()
+    const time = hash.subarray(0, 6).toString("hex")
+    const suffix = Array.from(hash.subarray(6, 20), (byte) => BASE62[byte % 62]).join("")
+    return `ses_${time}${suffix}`
+  }
   const current = BigInt(Date.now()) * 0x1000n + 1n
   const value = ~current
   const time = Array.from({ length: 6 }, (_, index) =>
@@ -1703,4 +2465,24 @@ function proxyError(error) {
       message: error instanceof Error ? error.message : String(error),
     },
   }
+}
+
+function readUpstreamError(text) {
+  const parsed = parseBody(text)
+  const detail = parsed?.error
+  return {
+    type: detail?.type ?? "upstream_error",
+    message:
+      ((typeof detail === "string" ? detail : detail?.message) ?? parsed?.message ?? text) ||
+      "Upstream request failed",
+    ...(detail?.code ? { code: detail.code } : {}),
+  }
+}
+
+function openAIUpstreamError(text) {
+  return { error: readUpstreamError(text) }
+}
+
+function anthropicUpstreamError(text) {
+  return { type: "error", error: readUpstreamError(text) }
 }

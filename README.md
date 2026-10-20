@@ -93,7 +93,11 @@ print(message.content)
 - Anthropic Messages API endpoint
 - Responses-to-Chat and Anthropic-to-Chat translation for compatible models
 - Replays thinking and reasoning content as `reasoning_content` for multi-turn thinking models
-- SSE passthrough for streaming clients
+- Supports Codex `custom` tools such as `apply_patch` and MCP `namespace` tools, restoring the original call types
+- Replays Responses reasoning through `encrypted_content` and emits replayable synthetic Anthropic thinking signatures
+- Removes `/think` and `/no_think` control markers and maps them to reasoning effort
+- Keeps a stable per-conversation `ses_...` upstream session ID
+- Native Responses/Anthropic SSE passthrough; Chat streaming is normalized and filtered
 - JSON aggregation for non-streaming clients
 - Responses-to-Chat translation for models that only support Chat Completions
 - Chat-to-Responses event translation for streaming clients
@@ -149,9 +153,10 @@ The translation covers:
 - `instructions` to a system message
 - `input` strings and item arrays to Chat Completions messages
 - `function_call` and `function_call_output` items
+- `custom_tool_call`, `custom_tool_call_output`, and namespaced calls
 - Responses tools to Chat Completions tools
 - `tool_choice`, `max_output_tokens`, and `reasoning.effort`
-- Text, reasoning, tool calls, usage, and streaming events in both directions
+- Text, reasoning, tool calls, usage, and streaming events in both directions, in their original block order
 - Reasoning items are replayed as `reasoning_content` on subsequent assistant turns
 
 ## Anthropic API Modes
@@ -172,7 +177,7 @@ The translation covers:
 - Anthropic tools and `tool_choice`
 - `max_tokens`, `temperature`, `top_p`, and `stop_sequences`
 - Text, thinking, tool calls, usage, and streaming events in both directions
-- Thinking blocks are replayed as `reasoning_content` on subsequent assistant turns
+- Thinking blocks are replayed as `reasoning_content` on subsequent assistant turns and use non-empty synthetic signatures
 
 ## Environment Variables
 
@@ -182,7 +187,7 @@ The translation covers:
 | `HOST` | `127.0.0.1` | Listen host |
 | `OPENCODE_ZEN_BASE_URL` | `https://opencode.ai/zen/v1` | Upstream base URL |
 | `OPENCODE_PROXY_UA` | `opencode/latest/2.0.32/cli` | Upstream User-Agent |
-| `OPENCODE_PROXY_SESSION` | generated | Fixed `ses_...` session |
+| `OPENCODE_PROXY_SESSION` | generated | Fixed `ses_...` session; otherwise derived per client conversation |
 | `OPENCODE_PROXY_PROJECT` | generated | Fixed 32-hex project ID |
 | `OPENCODE_PROXY_AUTH` | `public` | Upstream bearer token |
 | `OPENCODE_PROXY_PASSTHROUGH_AUTH` | unset | Forward the client's Authorization when set to `1` |
@@ -195,7 +200,8 @@ The translation covers:
 - Responses translation does not support `previous_response_id`, background tasks, hosted tools such as `web_search` or `file_search`, or file inputs.
 - Anthropic translation emits synthetic thinking signatures. Documents, citations, and provider-specific Anthropic extensions are not translated.
 - The upstream free-tier check is a heuristic client fingerprint and may change without notice.
-- The proxy injects a `read` tool marker. When the caller provides no tools, `tool_choice` is set to `none` to prevent the injected tool from being selected.
+- The proxy injects a `read` tool marker. When the caller provides no tools, `tool_choice` is set to `none`; when tools are present, a system instruction tells the model not to call this compatibility marker.
+- Codex only sends the freeform `apply_patch` tool for models whose Codex metadata declares it. For models Codex treats as unknown, it may fall back to the shell `apply_patch` command instead; that is not the proxy dropping the tool.
 - The server binds to `127.0.0.1` by default. Do not expose it publicly without authentication.
 
 ## Security Notes

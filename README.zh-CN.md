@@ -93,7 +93,11 @@ print(message.content)
 - Anthropic Messages API 端点
 - 将 Responses 和 Anthropic Messages 请求翻译为 Chat Completions
 - 多轮对话会将 thinking 和 reasoning 内容回填为 `reasoning_content`
-- 流式请求直接透传 SSE
+- 支持 Codex 的 `custom` 工具（例如 `apply_patch`）和 MCP `namespace` 工具，并正确还原调用类型
+- Responses 的 reasoning 会以 `encrypted_content` 形式回放；Anthropic thinking 会生成可回放的合成签名
+- 自动移除 `/think`、`/no_think` 控制标记，并转换为推理强度
+- 为同一客户端会话保持稳定的 `ses_...` 上游会话 ID
+- 原生 Responses/Anthropic 流式请求直接透传；Chat 流式会做规范化和过滤
 - 非流式请求自动聚合为 JSON
 - 将 Responses 请求翻译为 Chat Completions，适配只支持 Chat 协议的模型
 - 将 Chat Completions 事件翻译为 Responses API 的流式事件
@@ -149,10 +153,11 @@ node opencode-zen-proxy.mjs
 - `instructions` 转为 system message
 - `input` 字符串或数组转为 Chat Completions messages
 - `function_call` 和 `function_call_output` 项目
+- `custom_tool_call`、`custom_tool_call_output` 以及带 `namespace` 的调用
 - Responses 工具定义转为 Chat Completions 工具定义
 - `tool_choice`、`max_output_tokens`、`reasoning.effort`
 - 文本、推理内容、工具调用、usage 以及双向流式事件
-- 后续 assistant 轮次会将 reasoning 项回填为 `reasoning_content`
+- 后续 assistant 轮次会将 reasoning 项回填为 `reasoning_content`；文本、推理和工具调用按真实顺序输出
 
 ## Anthropic API 模式
 
@@ -172,7 +177,7 @@ node opencode-zen-proxy.mjs
 - Anthropic 工具定义和 `tool_choice`
 - `max_tokens`、`temperature`、`top_p`、`stop_sequences`
 - 文本、thinking、工具调用、usage 以及双向流式事件
-- 后续 assistant 轮次会将 thinking 块回填为 `reasoning_content`
+- 后续 assistant 轮次会将 thinking 块回填为 `reasoning_content`；thinking 使用非空合成签名
 
 ## 环境变量
 
@@ -182,7 +187,7 @@ node opencode-zen-proxy.mjs
 | `HOST` | `127.0.0.1` | 监听地址 |
 | `OPENCODE_ZEN_BASE_URL` | `https://opencode.ai/zen/v1` | 上游基础地址 |
 | `OPENCODE_PROXY_UA` | `opencode/latest/2.0.32/cli` | 上游 User-Agent |
-| `OPENCODE_PROXY_SESSION` | 自动生成 | 固定 `ses_...` 会话 |
+| `OPENCODE_PROXY_SESSION` | 自动生成 | 固定 `ses_...` 会话；未设置时按客户端会话自动派生 |
 | `OPENCODE_PROXY_PROJECT` | 自动生成 | 固定 32 位十六进制项目 ID |
 | `OPENCODE_PROXY_AUTH` | `public` | 上游 Bearer Token |
 | `OPENCODE_PROXY_PASSTHROUGH_AUTH` | 未设置 | 设为 `1` 时透传客户端的 Authorization |
@@ -195,7 +200,8 @@ node opencode-zen-proxy.mjs
 - Responses 翻译不支持 `previous_response_id`、后台任务、`web_search`/`file_search` 等托管工具，以及文件输入。
 - Anthropic 翻译会生成合成的 thinking 签名。文档、引用以及 Anthropic 提供商特有的扩展不会被翻译。
 - 上游免费层检查属于启发式客户端指纹，可能随时变化。
-- 代理会注入一个名为 `read` 的工具标记。调用方没有提供工具时，会设置 `tool_choice: "none"`，避免模型选择这个注入工具。
+- 代理会注入一个名为 `read` 的工具标记。调用方没有提供工具时，会设置 `tool_choice: "none"`；提供工具时会加入系统提示，要求模型不要调用这个兼容标记。
+- Codex 只会为带有相应模型元数据的模型发送自由格式的 `apply_patch` 工具；如果 Codex 把模型当作未知模型，它可能改用 shell 的 `apply_patch` 命令，这不是代理丢失了工具。
 - 默认只监听 `127.0.0.1`。不要在未增加认证的情况下公开监听。
 
 ## 安全说明
