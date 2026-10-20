@@ -3,10 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "OpenAI- and Anthropic-compatible proxy for using OpenCode Zen free models from other software.",
+  "description": "OpenAI-compatible Chat Completions proxy for using OpenCode Zen models from other software.",
   "scripts": {
     "start": "node opencode-zen-proxy.mjs",
-    "check": "node --check opencode-zen-proxy.mjs"
+    "check": "node --check opencode-zen-proxy.mjs && node --check test/proxy.test.mjs",
+    "test": "node --test test/proxy.test.mjs"
   },
   "engines": {
     "node": ">=20"

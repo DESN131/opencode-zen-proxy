@@ -1,8 +1,8 @@
 <h1 align="center">OpenCode Zen 代理</h1>
 
 <p align="center">
-  让其他软件和 agent 使用 OpenCode Zen 免费模型<br>
-  Chat Completions · Responses API · Anthropic Messages · 流式输出
+  OpenAI 兼容的 OpenCode Zen Chat Completions 代理<br>
+  流式输出 · 工具调用 · 推理内容回放
 </p>
 
 <p align="center">
@@ -14,35 +14,23 @@
 
 ## 快速开始
 
-**环境要求：** Node.js 20 或更高版本，无需安装 npm 依赖。
-
-启动代理后，将其他 OpenAI 或 Anthropic 兼容软件、agent 指向本地端点，即可使用 OpenCode Zen 免费模型。
+需要 Node.js 20 或更高版本，无 npm 运行时依赖。
 
 ```powershell
 npm start
 ```
 
-或者直接运行脚本：
+运行 `npm test` 可执行本地黑盒协议测试。
 
-```powershell
-node opencode-zen-proxy.mjs
-```
+代理默认监听 `http://127.0.0.1:8787/v1`。如果端口已被占用，会依次尝试最多 `PORT_ATTEMPTS` 个连续端口，并在日志中打印实际监听地址。
 
-默认监听地址：`http://127.0.0.1:8787/v1`。
-
-如果首选端口已被占用，代理会自动尝试后续端口（最多 `PORT_ATTEMPTS` 个），并在启动日志中打印实际监听地址。
-
-每个请求日志包含时间、状态码、模型、流式模式、输入/输出/总 token、缓存与推理 token、总耗时、首 token 延迟（TTFT）、实际生成窗口，以及按该窗口计算的输出速度（tok/s）。
-
-### 客户端配置
+## 客户端配置
 
 | 配置项 | 值 |
 | --- | --- |
 | Base URL | `http://127.0.0.1:8787/v1` |
-| API Key（免费模型） | `public` |
-| API Key（付费模型） | 真实 OpenCode API Key |
-
-### Responses API 示例
+| 免费模型 API Key | `public` |
+| 付费模型 API Key | 真实 OpenCode API Key |
 
 ```python
 from openai import OpenAI
@@ -52,17 +40,6 @@ client = OpenAI(
     api_key="public",
 )
 
-response = client.responses.create(
-    model="big-pickle",
-    input="Say hello",
-)
-
-print(response.output_text)
-```
-
-### Chat Completions 示例
-
-```python
 completion = client.chat.completions.create(
     model="big-pickle",
     messages=[{"role": "user", "content": "Say hello"}],
@@ -71,147 +48,67 @@ completion = client.chat.completions.create(
 print(completion.choices[0].message.content)
 ```
 
-### Anthropic Messages 示例
-
-```python
-from anthropic import Anthropic
-
-client = Anthropic(
-    base_url="http://127.0.0.1:8787",
-    api_key="public",
-)
-
-message = client.messages.create(
-    model="big-pickle",
-    max_tokens=200,
-    messages=[{"role": "user", "content": "Say hello"}],
-)
-
-print(message.content)
-```
-
-## 功能
-
-- 将 OpenCode Zen 免费模型代理给其他软件和 agent
-- OpenAI 兼容的 Chat Completions 和 Responses 端点
-- Anthropic Messages API 端点
-- 将 Responses 和 Anthropic Messages 请求翻译为 Chat Completions
-- 多轮对话会将 thinking 和 reasoning 内容回填为 `reasoning_content`
-- 支持 Codex 的 `custom` 工具（例如 `apply_patch`）和 MCP `namespace` 工具，并正确还原调用类型
-- Responses 的 reasoning 会以 `encrypted_content` 形式回放；Anthropic thinking 会生成可回放的合成签名
-- 自动移除 `/think`、`/no_think` 控制标记，并转换为推理强度
-- 为同一客户端会话保持稳定的 `ses_...` 上游会话 ID
-- 原生 Responses/Anthropic 流式请求直接透传；Chat 流式会做规范化和过滤
-- 非流式请求自动聚合为 JSON
-- 将 Responses 请求翻译为 Chat Completions，适配只支持 Chat 协议的模型
-- 将 Chat Completions 事件翻译为 Responses API 的流式事件
-- 为免费模型自动补充 OpenCode 兼容的请求标记
-- 没有 npm 运行时依赖，只使用 Node.js 内置模块
-
-## 免费模型与付费模型
-
-### 免费模型
-
-免费模型不需要真实 API Key。这是本代理的主要用途：让其他软件和 agent 通过本地代理调用 Zen 免费模型。客户端填写 `public` 或其他占位符即可。代理会自动补充上游免费层检查所需的 OpenCode 兼容请求标记。
-
-### 付费模型
-
-为代理提供真实 OpenCode API Key：
-
-```powershell
-$env:OPENCODE_PROXY_AUTH = "your-real-key"
-node opencode-zen-proxy.mjs
-```
-
-或者透传客户端自己的 `Authorization`：
-
-```powershell
-$env:OPENCODE_PROXY_PASSTHROUGH_AUTH = "1"
-node opencode-zen-proxy.mjs
-```
-
-付费模型由上游服务计费。代理会把 `401`、`402`、`429` 等上游错误原样返回。
-
 ## 端点
 
 | 端点 | 说明 |
 | --- | --- |
-| `POST /v1/chat/completions` | OpenAI 兼容的 Chat Completions |
-| `POST /v1/responses` | Responses API，支持原生或翻译模式 |
-| `POST /v1/messages` | Anthropic Messages API，支持原生或翻译模式 |
-| `GET /v1/models` | 获取上游模型列表 |
+| `POST /v1/chat/completions` | OpenAI 兼容 Chat Completions，支持流式与 JSON |
+| `GET /v1/models` | 上游模型列表 |
 | `GET /health` | 本地代理健康检查 |
 
-## Responses API 模式
+本仓库已移除 Responses API 与 Anthropic Messages 路由。访问这两个协议会返回 OpenAI 格式的 `404` 错误。
 
-通过 `OPENCODE_PROXY_RESPONSES_MODE` 控制 `/v1/responses` 的行为：
+## 行为
 
-| 值 | 行为 |
-| --- | --- |
-| `auto`（默认） | 免费模型使用 Chat Completions 翻译；其他模型先尝试原生 Responses，遇到 `ModelProtocolUnsupported` 时自动回退 |
-| `chat` | 始终将 Responses 请求翻译为 Chat Completions |
-| `native` | 始终使用原生 Responses 端点 |
+- 自动补充 Zen 免费层要求的 OpenCode 兼容请求标记。
+- 支持标准 function tools；即使工具名称和参数分散在多个 SSE 分片中，也能保留有效的调用方工具调用。
+- 多轮推理模型会将 assistant 的 `reasoning_content` 回放给上游。
+- 确定性地移除全部 user 历史开头的 `/think` 或 `/no_think`；只有最新 user 的标记会改变本次请求的推理强度。
+- 非流式客户端请求上游 SSE 时，自动聚合为标准 JSON Chat Completions 响应。
+- 上游忽略 `stream: true` 并返回 JSON Chat Completion 时，会转换为合法 SSE；JSON 错误会明确返回，不再变成空流。
+- 流式响应始终以带 `finish_reason` 的终帧和 `[DONE]` 结束；上游提前 EOF 或发送 SSE error 时也能安全终止。非流式响应被截断时返回 `502`。
+- 按客户端会话派生稳定的上游 `ses_...` 会话 ID。
+- 日志包含时间、token 用量、TTFT、实际生成时间和输出速度。
 
-翻译范围包括：
+## 付费模型
 
-- `instructions` 转为 system message
-- `input` 字符串或数组转为 Chat Completions messages
-- `function_call` 和 `function_call_output` 项目
-- `custom_tool_call`、`custom_tool_call_output` 以及带 `namespace` 的调用
-- Responses 工具定义转为 Chat Completions 工具定义
-- `tool_choice`、`max_output_tokens`、`reasoning.effort`
-- 文本、推理内容、工具调用、usage 以及双向流式事件
-- 后续 assistant 轮次会将 reasoning 项回填为 `reasoning_content`；文本、推理和工具调用按真实顺序输出
+为代理设置 OpenCode API Key：
 
-## Anthropic API 模式
+```powershell
+$env:OPENCODE_PROXY_AUTH = "your-real-key"
+npm start
+```
 
-通过 `OPENCODE_PROXY_ANTHROPIC_MODE` 控制 `/v1/messages` 的行为：
+或透传客户端自己的 `Authorization`：
 
-| 值 | 行为 |
-| --- | --- |
-| `auto`（默认） | 免费模型使用 Chat Completions 翻译；其他模型先尝试原生 Anthropic Messages，遇到 `ModelProtocolUnsupported` 时自动回退 |
-| `chat` | 始终将 Anthropic Messages 请求翻译为 Chat Completions |
-| `native` | 始终使用原生 Anthropic Messages 端点 |
+```powershell
+$env:OPENCODE_PROXY_PASSTHROUGH_AUTH = "1"
+npm start
+```
 
-翻译范围包括：
-
-- `system` 提示词和文本内容块
-- 图片内容块
-- `tool_use` 和 `tool_result` 内容块
-- Anthropic 工具定义和 `tool_choice`
-- `max_tokens`、`temperature`、`top_p`、`stop_sequences`
-- 文本、thinking、工具调用、usage 以及双向流式事件
-- 后续 assistant 轮次会将 thinking 块回填为 `reasoning_content`；thinking 使用非空合成签名
+免费模型通常使用 `public`。付费模型由上游服务计费。
 
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `PORT` | `8787` | 监听端口 |
+| `PORT` | `8787` | 首选监听端口 |
 | `HOST` | `127.0.0.1` | 监听地址 |
-| `PORT_ATTEMPTS` | `20` | 首选端口被占用时，最多向后尝试的连续端口数 |
-| `LOG_TIME_ZONE` | `Asia/Hong_Kong` | 日志时间戳使用的时区 |
+| `PORT_ATTEMPTS` | `20` | 首选端口占用时最多尝试的连续端口数 |
+| `LOG_TIME_ZONE` | `Asia/Hong_Kong` | 日志时间戳时区 |
+| `OPENCODE_STREAM_IDLE_TIMEOUT_MS` | `120000` | 等待上游响应头或流数据的最长空闲时间；设为 `0` 可关闭 |
 | `OPENCODE_ZEN_BASE_URL` | `https://opencode.ai/zen/v1` | 上游基础地址 |
 | `OPENCODE_PROXY_UA` | `opencode/latest/2.0.32/cli` | 上游 User-Agent |
-| `OPENCODE_PROXY_SESSION` | 自动生成 | 固定 `ses_...` 会话；未设置时按客户端会话自动派生 |
+| `OPENCODE_PROXY_SESSION` | 自动生成 | 固定 `ses_...` 会话 |
 | `OPENCODE_PROXY_PROJECT` | 自动生成 | 固定 32 位十六进制项目 ID |
 | `OPENCODE_PROXY_AUTH` | `public` | 上游 Bearer Token |
 | `OPENCODE_PROXY_PASSTHROUGH_AUTH` | 未设置 | 设为 `1` 时透传客户端的 Authorization |
-| `OPENCODE_PROXY_RESPONSES_MODE` | `auto` | `auto`、`chat` 或 `native` |
-| `OPENCODE_PROXY_ANTHROPIC_MODE` | `auto` | `auto`、`chat` 或 `native` |
 
 ## 限制
 
-- 目前只实现 Chat Completions、Responses 和 Anthropic Messages。不支持 Google `generateContent`、embeddings、图片和音频端点。
-- Responses 翻译不支持 `previous_response_id`、后台任务、`web_search`/`file_search` 等托管工具，以及文件输入。
-- Anthropic 翻译会生成合成的 thinking 签名。文档、引用以及 Anthropic 提供商特有的扩展不会被翻译。
+- 仅支持 Chat Completions。Embeddings、图片生成、音频、Responses API 与 Anthropic Messages 均未实现。
 - 上游免费层检查属于启发式客户端指纹，可能随时变化。
-- 代理会注入一个名为 `read` 的工具标记。调用方没有提供工具时，会设置 `tool_choice: "none"`；提供工具时会加入系统提示，要求模型不要调用这个兼容标记。
-- Codex 只会为带有相应模型元数据的模型发送自由格式的 `apply_patch` 工具；如果 Codex 把模型当作未知模型，它可能改用 shell 的 `apply_patch` 命令，这不是代理丢失了工具。
-- 默认只监听 `127.0.0.1`。不要在未增加认证的情况下公开监听。
+- 代理会注入一个最小的 `read` 工具标记。调用方未提供工具时强制设置 `tool_choice: "none"`；提供工具时会加入系统提示，要求模型不要调用该标记。上游返回的 `read` 调用会按完整工具调用移除，不会泄漏跨分片的孤立参数。
+- 默认只监听回环地址；除非增加认证层，否则不要公开暴露。
 
-## 安全说明
-
-- 不要把真实 API Key 提交到仓库或写入日志。
-- 除非增加认证层，否则保持回环地址监听。
-- 从其他 agent 使用免费层前，请确认并遵守上游服务的相关条款。
+不要提交真实 API Key。从其他 agent 使用免费层前，请确认并遵守上游服务条款。
