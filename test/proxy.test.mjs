@@ -423,6 +423,57 @@ test("opencode-zen-proxy Chat Completions regressions", async (context) => {
     assert.ok(Date.now() - startedAt < 1500)
   })
 
+  await context.test("falls back to the next port when the preferred port is occupied", async () => {
+    const occupied = http.createServer((_request, response) => {
+      response.writeHead(200)
+      response.end("occupied")
+    })
+    await new Promise((resolve) => occupied.listen(0, "127.0.0.1", resolve))
+    const occupiedPort = occupied.address().port
+    let fallbackProxy
+    let output = ""
+    try {
+      fallbackProxy = spawn(process.execPath, [PROXY], {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          PORT: String(occupiedPort),
+          PORT_ATTEMPTS: "3",
+          HOST: "127.0.0.1",
+          OPENCODE_STREAM_IDLE_TIMEOUT_MS: "250",
+          OPENCODE_ZEN_BASE_URL: `http://127.0.0.1:${upstream.address().port}`,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      })
+      fallbackProxy.stdout.setEncoding("utf8")
+      fallbackProxy.stderr.setEncoding("utf8")
+      const origin = await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`fallback proxy startup timeout\n${output}`)), 10000)
+        const onData = (value) => {
+          output += value
+          const match = /listening on (http:\/\/127\.0\.0\.1:\d+)\/v1/.exec(output)
+          if (!match) return
+          clearTimeout(timer)
+          resolve(match[1])
+        }
+        fallbackProxy.stdout.on("data", onData)
+        fallbackProxy.stderr.on("data", onData)
+        fallbackProxy.once("exit", (code) => {
+          clearTimeout(timer)
+          reject(new Error(`fallback proxy exited with ${code}\n${output}`))
+        })
+      })
+
+      assert.notEqual(new URL(origin).port, String(occupiedPort))
+      assert.match(output, new RegExp(`port ${occupiedPort} is unavailable \\(EADDRINUSE\\)`))
+      assert.equal((await fetch(`${origin}/health`)).status, 200)
+    } finally {
+      fallbackProxy?.kill()
+      occupied.closeAllConnections?.()
+      await new Promise((resolve) => occupied.close(resolve))
+    }
+  })
+
   await context.test("keeps unsupported routes at 404", async () => {
     assert.equal((await post("/v1/responses", {})).status, 404)
     assert.equal((await post("/v1/messages", {})).status, 404)

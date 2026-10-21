@@ -22,7 +22,7 @@ npm start
 
 运行 `npm test` 可执行本地黑盒协议测试。
 
-代理默认监听 `http://127.0.0.1:8787/v1`。如果端口已被占用，会依次尝试最多 `PORT_ATTEMPTS` 个连续端口，并在日志中打印实际监听地址。
+代理默认监听 `http://127.0.0.1:8787/v1`。如果端口已被占用，或因为系统端口保留、权限限制而不可用，会依次尝试最多 `PORT_ATTEMPTS` 个连续端口，并在日志中打印实际监听地址。
 
 ## 客户端配置
 
@@ -94,7 +94,7 @@ npm start
 | --- | --- | --- |
 | `PORT` | `8787` | 首选监听端口 |
 | `HOST` | `127.0.0.1` | 监听地址 |
-| `PORT_ATTEMPTS` | `20` | 首选端口占用时最多尝试的连续端口数 |
+| `PORT_ATTEMPTS` | `200` | 首选端口占用或不可用时最多尝试的连续端口数 |
 | `LOG_TIME_ZONE` | `Asia/Hong_Kong` | 日志时间戳时区 |
 | `OPENCODE_STREAM_IDLE_TIMEOUT_MS` | `120000` | 等待上游响应头或流数据的最长空闲时间；设为 `0` 可关闭 |
 | `OPENCODE_ZEN_BASE_URL` | `https://opencode.ai/zen/v1` | 上游基础地址 |

@@ -22,7 +22,7 @@ npm start
 
 Run `npm test` for the local black-box protocol tests.
 
-The proxy listens on `http://127.0.0.1:8787/v1` by default. If that port is in use, it tries up to `PORT_ATTEMPTS` consecutive ports and logs the actual address.
+The proxy listens on `http://127.0.0.1:8787/v1` by default. If that port is occupied or unavailable due to an OS exclusion/permission error, it tries up to `PORT_ATTEMPTS` consecutive ports and logs the actual address.
 
 ## Client Settings
 
@@ -94,7 +94,7 @@ Free models normally use `public`. Paid usage is billed by the upstream service.
 | --- | --- | --- |
 | `PORT` | `8787` | Preferred listen port |
 | `HOST` | `127.0.0.1` | Listen host |
-| `PORT_ATTEMPTS` | `20` | Consecutive ports to try when the preferred port is occupied |
+| `PORT_ATTEMPTS` | `200` | Consecutive ports to try when the preferred port is occupied or unavailable |
 | `LOG_TIME_ZONE` | `Asia/Hong_Kong` | Time zone for log timestamps |
 | `OPENCODE_STREAM_IDLE_TIMEOUT_MS` | `120000` | Maximum idle time while waiting for upstream headers or stream chunks; set to `0` to disable |
 | `OPENCODE_ZEN_BASE_URL` | `https://opencode.ai/zen/v1` | Upstream base URL |
