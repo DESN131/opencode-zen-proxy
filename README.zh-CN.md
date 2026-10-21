@@ -1,8 +1,8 @@
 <h1 align="center">OpenCode Zen 代理</h1>
 
 <p align="center">
-  OpenAI 兼容的 OpenCode Zen Chat Completions 代理<br>
-  流式输出 · 工具调用 · 推理内容回放
+  让其他软件和 agent 使用 OpenCode 免费模型<br>
+  OpenAI Chat Completions · 流式输出 · 工具调用 · 推理内容
 </p>
 
 <p align="center">

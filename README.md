@@ -1,8 +1,8 @@
 <h1 align="center">OpenCode Zen Proxy</h1>
 
 <p align="center">
-  OpenAI-compatible Chat Completions proxy for OpenCode Zen models<br>
-  Streaming · Tool calls · Reasoning replay
+  Use OpenCode free models from other software and agents<br>
+  OpenAI Chat Completions · Streaming · Tool calls · Reasoning
 </p>
 
 <p align="center">
