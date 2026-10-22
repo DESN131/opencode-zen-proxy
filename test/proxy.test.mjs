@@ -63,6 +63,8 @@ async function handleUpstream(request, response) {
         object: "chat.completion",
         created: 1,
         model: "mock-model",
+        system_fingerprint: "fp_json",
+        service_tier: "default",
         choices: [
           {
             index: 0,
@@ -143,8 +145,59 @@ async function handleUpstream(request, response) {
     response.end("data: [DONE]\n\n")
     return
   }
+  if (scenario === "user-tool-delayed") {
+    sendSse(response, chunk({ role: "assistant", tool_calls: [{ index: 0, id: "call_lookup_delayed", type: "function", function: { name: "lookup", arguments: "{\"q\":" } }] }))
+    const timer = setTimeout(() => {
+      sendSse(response, chunk({ tool_calls: [{ index: 0, function: { arguments: "\"late\"}" } }] }))
+      sendSse(response, chunk({}, "tool_calls"))
+      response.end("data: [DONE]\n\n")
+    }, 300)
+    response.on("close", () => clearTimeout(timer))
+    return
+  }
+  if (scenario === "rich-stream") {
+    sendSse(response, chunk(
+      {
+        role: "assistant",
+        content: "rich",
+        annotations: [{ type: "url_citation", url: "https://example.test" }],
+        audio: { id: "audio_1", expires_at: 123, data: "AA", transcript: "hel" },
+      },
+      null,
+      { system_fingerprint: "fp_mock", service_tier: "default" },
+    ))
+    sendSse(response, {
+      id: "mock-chat",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "mock-model",
+      system_fingerprint: "fp_mock",
+      choices: [
+        {
+          index: 0,
+          delta: { refusal: "blocked", audio: { id: "audio_1", data: "BB", transcript: "lo" } },
+          finish_reason: "stop",
+          logprobs: { content: [{ token: "rich", logprob: -0.1 }] },
+        },
+      ],
+      usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+    })
+    response.end("data: [DONE]\n\n")
+    return
+  }
   if (scenario === "caller-read") {
     sendSse(response, chunk({ role: "assistant", tool_calls: [{ index: 0, id: "call_caller_read", type: "function", function: { name: "read", arguments: "{\"path\":\"notes.txt\"}" } }] }))
+    sendSse(response, chunk({}, "tool_calls"))
+    response.end("data: [DONE]\n\n")
+    return
+  }
+  if (scenario === "caller-read-file") {
+    sendSse(response, chunk(
+      { role: "assistant", tool_calls: [{ index: 0, id: "call_read_file", type: "function", function: { name: "read", arguments: "" } }] },
+      null,
+      { system_fingerprint: "fp_tool", service_tier: "default" },
+    ))
+    sendSse(response, chunk({ tool_calls: [{ index: 0, function: { name: "_file", arguments: "{\"path\":\"notes.txt\"}" } }] }))
     sendSse(response, chunk({}, "tool_calls"))
     response.end("data: [DONE]\n\n")
     return
@@ -255,6 +308,8 @@ test("opencode-zen-proxy Chat Completions regressions", async (context) => {
     assert.equal(response.status, 200)
     assert.match(response.headers.get("content-type"), /text\/event-stream/)
     assert.match(text, /hello from JSON/)
+    assert.equal(parsedEvents(text)[0].system_fingerprint, "fp_json")
+    assert.equal(parsedEvents(text)[0].service_tier, "default")
     assert.equal(finishReason(text), "stop")
     assert.equal(events(text).at(-1), "[DONE]")
   })
@@ -343,14 +398,30 @@ test("opencode-zen-proxy Chat Completions regressions", async (context) => {
       tools: [{ type: "function", function: { name: "lookup", parameters: { type: "object", properties: {} } } }],
     }))
     const text = await response.text()
-    const toolCall = parsedEvents(text)
+    const fragments = parsedEvents(text)
       .flatMap((event) => event.choices ?? [])
-      .flatMap((choice) => choice.delta?.tool_calls ?? [])[0]
+      .flatMap((choice) => choice.delta?.tool_calls ?? [])
     assert.equal(response.status, 200)
-    assert.equal(toolCall.function.name, "lookup")
-    assert.equal(toolCall.function.arguments, "{\"q\":\"x\"}")
+    assert.equal(fragments.map((call) => call.function?.name ?? "").join(""), "lookup")
+    assert.equal(fragments.map((call) => call.function?.arguments ?? "").join(""), "{\"q\":\"x\"}")
     assert.equal(finishReason(text), "tool_calls")
     assert.ok(requests.at(-1).messages.some((message) => String(message.content).includes("proxy compatibility marker")))
+  })
+
+  await context.test("streams a caller tool call before the upstream finishes", async () => {
+    const startedAt = Date.now()
+    const response = await post("/v1/chat/completions", chat("scenario:user-tool-delayed", {
+      stream: true,
+      tools: [{ type: "function", function: { name: "lookup", parameters: { type: "object", properties: {} } } }],
+    }))
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    const firstRead = await reader.read()
+    const firstText = decoder.decode(firstRead.value, { stream: true })
+    assert.equal(response.status, 200)
+    assert.ok(Date.now() - startedAt < 250)
+    assert.match(firstText, /lookup/)
+    await reader.cancel()
   })
 
   await context.test("preserves a read tool owned by the caller", async () => {
@@ -367,6 +438,24 @@ test("opencode-zen-proxy Chat Completions regressions", async (context) => {
     assert.equal(choices.filter((choice) => choice.finish_reason).length, 1)
   })
 
+  await context.test("does not confuse a fragmented caller read_file tool with the marker", async () => {
+    const response = await post("/v1/chat/completions", chat("scenario:caller-read-file", {
+      stream: true,
+      tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object", properties: {} } } }],
+    }))
+    const text = await response.text()
+    const calls = parsedEvents(text)
+      .flatMap((event) => event.choices ?? [])
+      .flatMap((choice) => choice.delta?.tool_calls ?? [])
+    const toolEvent = parsedEvents(text).find((event) => event.choices?.some((choice) => choice.delta?.tool_calls))
+    assert.equal(response.status, 200)
+    assert.equal(calls.map((call) => call.function?.name ?? "").join(""), "read_file")
+    assert.equal(calls.map((call) => call.function?.arguments ?? "").join(""), "{\"path\":\"notes.txt\"}")
+    assert.equal(toolEvent.system_fingerprint, "fp_tool")
+    assert.equal(toolEvent.service_tier, "default")
+    assert.equal(finishReason(text), "tool_calls")
+  })
+
   await context.test("forces tool_choice none when the caller supplies no tools", async () => {
     const response = await post("/v1/chat/completions", chat("scenario:normal-stream", {
       stream: true,
@@ -374,6 +463,36 @@ test("opencode-zen-proxy Chat Completions regressions", async (context) => {
     }))
     await response.text()
     assert.equal(requests.at(-1).tool_choice, "none")
+  })
+
+  await context.test("rejects Chat options that cannot be represented faithfully", async () => {
+    const multiChoice = await post("/v1/chat/completions", chat("scenario:normal-stream", { n: 2 }))
+    const multiChoiceBody = await multiChoice.json()
+    assert.equal(multiChoice.status, 400)
+    assert.equal(multiChoiceBody.error.code, "unsupported_parameter")
+
+    const logprobs = await post("/v1/chat/completions", chat("scenario:normal-stream", { logprobs: true }))
+    const logprobsBody = await logprobs.json()
+    assert.equal(logprobs.status, 400)
+    assert.equal(logprobsBody.error.code, "unsupported_parameter")
+  })
+
+  await context.test("preserves standard Chat response metadata when aggregating SSE", async () => {
+    const response = await post("/v1/chat/completions", chat("scenario:rich-stream"))
+    const body = await response.json()
+    assert.equal(response.status, 200)
+    assert.equal(body.system_fingerprint, "fp_mock")
+    assert.equal(body.service_tier, "default")
+    assert.equal(body.choices[0].message.content, "rich")
+    assert.equal(body.choices[0].message.refusal, "blocked")
+    assert.deepEqual(body.choices[0].message.annotations, [{ type: "url_citation", url: "https://example.test" }])
+    assert.deepEqual(body.choices[0].message.audio, {
+      id: "audio_1",
+      expires_at: 123,
+      data: "AABB",
+      transcript: "hello",
+    })
+    assert.deepEqual(body.choices[0].logprobs.content, [{ token: "rich", logprob: -0.1 }])
   })
 
   await context.test("strips think markers deterministically from history", async () => {

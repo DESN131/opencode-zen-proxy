@@ -61,12 +61,13 @@ Responses API and Anthropic Messages routes are intentionally not implemented. U
 ## Behavior
 
 - Adds the OpenCode-compatible request markers required by the Zen free tier.
-- Supports standard function tools and preserves valid caller tool calls even when their name and arguments span multiple SSE chunks.
+- Supports standard function tools and preserves valid caller tool calls even when their name and arguments span multiple SSE chunks. Non-marker tool calls continue streaming as soon as their name is distinguishable from the injected `read` marker.
 - Replays assistant `reasoning_content` for multi-turn reasoning models.
 - Removes leading `/think` and `/no_think` markers from all user history deterministically; only the latest user marker changes this request's reasoning effort.
-- Aggregates upstream SSE into a normal JSON Chat Completions response for non-streaming clients.
+- Aggregates upstream SSE into a normal JSON Chat Completions response for non-streaming clients while preserving standard response metadata such as `system_fingerprint`, `service_tier`, choice `logprobs`, message `refusal`, and `annotations`.
 - Converts a JSON Chat Completion into SSE when the upstream ignores `stream: true`, and reports JSON errors instead of emitting an empty stream.
 - Ensures streaming responses end with a `finish_reason` chunk and `[DONE]`, including premature EOF and SSE error recovery. A truncated non-streaming response returns `502`.
+- Applies backpressure to streaming writes so a slow client does not cause unbounded buffering in the proxy.
 - Keeps a stable upstream `ses_...` session per client conversation.
 - Logs timestamps, token usage, TTFT, generation time, and output speed.
 
@@ -107,6 +108,7 @@ Free models normally use `public`. Paid usage is billed by the upstream service.
 ## Limitations
 
 - Only Chat Completions is supported. Embeddings, image generation, audio, Responses API, and Anthropic Messages are not implemented.
+- The proxy currently supports one choice. Requests with `n != 1`, `logprobs`, or `top_logprobs` fail with `400 unsupported_parameter` instead of being silently degraded.
 - The upstream free-tier check is a heuristic client fingerprint and may change without notice.
 - The proxy injects a minimal `read` tool marker. If the caller sends no tools, `tool_choice` is forced to `none`; if tools are present, a system instruction tells the model not to call that marker. Any `read` call returned by the upstream is removed completely across streamed tool-call fragments.
 - Keep the listener on loopback unless you add authentication.
