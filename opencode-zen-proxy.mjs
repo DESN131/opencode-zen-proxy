@@ -294,6 +294,7 @@ async function proxyChat(request, response) {
     json(response, 400, { error: { type: "invalid_request", message: "messages must be an array" } })
     return
   }
+  validateChatOptions(input)
 
   const wantsStream = input.stream === true
   const rewritten = rewriteBody(input, wantsStream)
@@ -447,32 +448,33 @@ function streamChatCompletion(response, chat, includeUsage) {
     "cache-control": "no-cache",
     connection: "keep-alive",
   })
+  const { choices = [], usage, object: _object, ...metadata } = chat
   const base = {
-    id: chat.id ?? `chatcmpl-${randomBytes(12).toString("hex")}`,
+    ...metadata,
+    id: metadata.id ?? `chatcmpl-${randomBytes(12).toString("hex")}`,
     object: "chat.completion.chunk",
-    created: chat.created ?? Math.floor(Date.now() / 1000),
-    model: chat.model ?? "unknown",
+    created: metadata.created ?? Math.floor(Date.now() / 1000),
+    model: metadata.model ?? "unknown",
   }
   const write = (value) => response.write(`data: ${JSON.stringify(value)}\n\n`)
-  for (const choice of chat.choices ?? []) {
-    const message = choice?.message ?? {}
-    const delta = { role: message.role ?? "assistant" }
-    if (message.content !== undefined) delta.content = message.content
-    if (message.reasoning_content !== undefined) delta.reasoning_content = message.reasoning_content
-    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-      delta.tool_calls = message.tool_calls.map((call, index) => ({ ...call, index }))
+  for (const choice of choices) {
+    const { message = {}, finish_reason, index = 0, ...choiceMetadata } = choice
+    const { role = "assistant", tool_calls, ...messageData } = message
+    const delta = { role, ...messageData }
+    if (Array.isArray(tool_calls) && tool_calls.length > 0) {
+      delta.tool_calls = tool_calls.map((call, toolIndex) => ({ ...call, index: toolIndex }))
     }
-    write({ ...base, choices: [{ index: choice.index ?? 0, delta, finish_reason: null }] })
+    write({ ...base, choices: [{ ...choiceMetadata, index, delta, finish_reason: null }] })
     const finishReason =
-      Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0 && (!choice.finish_reason || choice.finish_reason === "stop")
+      Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0 && (!finish_reason || finish_reason === "stop")
         ? "tool_calls"
-        : choice.finish_reason ?? "stop"
+        : finish_reason ?? "stop"
     write({
       ...base,
-      choices: [{ index: choice.index ?? 0, delta: {}, finish_reason: finishReason }],
+      choices: [{ index, delta: {}, finish_reason: finishReason }],
     })
   }
-  if (includeUsage && chat.usage) write({ ...base, choices: [], usage: chat.usage })
+  if (includeUsage && usage) write({ ...base, choices: [], usage })
   response.write("data: [DONE]\n\n")
   response.end()
 }
@@ -485,6 +487,21 @@ function upstreamErrorStatus(value) {
   const parsed = typeof value === "string" ? parseBody(value) : value
   const status = Number(parsed?.error?.statusCode ?? parsed?.error?.status ?? parsed?.status)
   return Number.isInteger(status) && status >= 400 && status <= 599 ? status : 502
+}
+
+function validateChatOptions(input) {
+  const unsupported = (name, value, detail) => {
+    const error = new Error(`${name}=${JSON.stringify(value)} is not supported by this proxy: ${detail}`)
+    error.status = 400
+    error.code = "unsupported_parameter"
+    throw error
+  }
+  if (input.n !== undefined && Number(input.n) !== 1) {
+    unsupported("n", input.n, "only one choice is supported")
+  }
+  if (input.logprobs === true || Number(input.top_logprobs ?? 0) > 0) {
+    unsupported("logprobs", input.logprobs ?? input.top_logprobs, "token log probabilities are unavailable")
+  }
 }
 
 async function fetchUpstream(controller, options) {
@@ -544,6 +561,7 @@ function rewriteBody(input, wantsStream) {
       )
     : messages
   const body = { ...input, messages: normalized, stream: true }
+  if (input.n !== undefined) body.n = 1
   const inputTools = Array.isArray(input.tools) ? input.tools : []
   const tools = [...inputTools]
   const hasRead = tools.some((tool) => tool?.function?.name === "read" || tool?.name === "read")
@@ -740,19 +758,85 @@ async function aggregate(upstream, injectedRead = false, stats) {
   const decoder = new TextDecoder()
   const textFilter = new ControlTextFilter()
   const reasoningFilter = new ControlTextFilter()
-  const result = {
-    id: "",
-    created: 0,
-    model: "",
-    content: "",
-    reasoning: "",
-    finishReason: "stop",
-    usage: undefined,
-    toolCalls: new Map(),
-  }
+  const metadata = {}
+  const message = { role: "assistant", content: "" }
+  const choiceExtras = {}
+  const toolCalls = new Map()
+  let finishReason = "stop"
+  const logprobs = {}
+  let usage
   let buffer = ""
   let sawFinish = false
   let sawDone = false
+
+  const mergeStableValue = (target, key, value) => {
+    if (value === undefined) return
+    const current = target[key]
+    if (Array.isArray(value)) {
+      target[key] = [...(Array.isArray(current) ? current : []), ...value]
+      return
+    }
+    if (value && typeof value === "object") {
+      if (!current || typeof current !== "object" || Array.isArray(current)) target[key] = {}
+      for (const [nestedKey, nestedValue] of Object.entries(value)) {
+        mergeStableValue(target[key], nestedKey, nestedValue)
+      }
+      return
+    }
+    target[key] = value
+  }
+  const appendString = (target, key, value) => {
+    if (typeof value !== "string") return
+    target[key] = (target[key] ?? "") + value
+  }
+  const mergeDeltaObject = (target, key, value, appendKeys) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return
+    if (!target[key] || typeof target[key] !== "object" || Array.isArray(target[key])) target[key] = {}
+    for (const [nestedKey, nestedValue] of Object.entries(value)) {
+      if (appendKeys.includes(nestedKey)) appendString(target[key], nestedKey, nestedValue)
+      else mergeStableValue(target[key], nestedKey, nestedValue)
+    }
+  }
+  const mergeChoice = (choice) => {
+    if ((choice.index ?? 0) !== 0) return
+    const delta = choice.delta ?? {}
+    if (typeof delta.content === "string" && delta.content.length > 0) {
+      markOutput(stats)
+      message.content += textFilter.push(delta.content)
+    }
+    if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+      markOutput(stats)
+      message.reasoning_content = (message.reasoning_content ?? "") + reasoningFilter.push(delta.reasoning_content)
+    }
+    if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+      markOutput(stats)
+      message.content += textFilter.flush()
+      const trailingReasoning = reasoningFilter.flush()
+      if (trailingReasoning) message.reasoning_content = (message.reasoning_content ?? "") + trailingReasoning
+      textFilter.reset()
+      reasoningFilter.reset()
+      mergeToolCalls(toolCalls, delta.tool_calls)
+    }
+    for (const [key, value] of Object.entries(delta)) {
+      if (key === "content" || key === "reasoning_content" || key === "tool_calls" || key === "role") continue
+      if (key === "refusal" || key === "reasoning" || key === "reasoning_text") appendString(message, key, value)
+      else if (key === "function_call") mergeDeltaObject(message, key, value, ["name", "arguments"])
+      else if (key === "audio") mergeDeltaObject(message, key, value, ["data", "transcript"])
+      else mergeStableValue(message, key, value)
+    }
+    if (typeof delta.role === "string") message.role = delta.role
+    if (choice.logprobs) {
+      for (const [key, value] of Object.entries(choice.logprobs)) mergeStableValue(logprobs, key, value)
+    }
+    if (choice.finish_reason) {
+      sawFinish = true
+      finishReason = choice.finish_reason
+    }
+    for (const [key, value] of Object.entries(choice)) {
+      if (["index", "delta", "finish_reason", "logprobs"].includes(key)) continue
+      mergeStableValue(choiceExtras, key, value)
+    }
+  }
 
   const consume = (line) => {
     if (!line.startsWith("data:")) return
@@ -771,33 +855,12 @@ async function aggregate(upstream, injectedRead = false, stats) {
       error.status = chunk.error.statusCode ?? chunk.error.status ?? 502
       throw error
     }
-    if (chunk.id) result.id = chunk.id
-    if (chunk.created) result.created = chunk.created
-    if (chunk.model) result.model = chunk.model
-    if (chunk.usage) result.usage = chunk.usage
-    for (const choice of chunk.choices ?? []) {
-      const delta = choice.delta ?? {}
-      if (typeof delta.content === "string" && delta.content.length > 0) {
-        markOutput(stats)
-        result.content += textFilter.push(delta.content)
-      }
-      if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
-        markOutput(stats)
-        result.reasoning += reasoningFilter.push(delta.reasoning_content)
-      }
-      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
-        markOutput(stats)
-        result.content += textFilter.flush()
-        result.reasoning += reasoningFilter.flush()
-        textFilter.reset()
-        reasoningFilter.reset()
-        mergeToolCalls(result.toolCalls, delta.tool_calls)
-      }
-      if (choice.finish_reason) {
-        sawFinish = true
-        result.finishReason = choice.finish_reason
-      }
+    if (chunk.usage) usage = chunk.usage
+    for (const [key, value] of Object.entries(chunk)) {
+      if (["object", "choices", "usage"].includes(key)) continue
+      metadata[key] = value
     }
+    for (const choice of chunk.choices ?? []) mergeChoice(choice)
   }
 
   while (true) {
@@ -813,51 +876,80 @@ async function aggregate(upstream, injectedRead = false, stats) {
   }
   buffer += decoder.decode()
   if (buffer.trim()) consume(buffer.trim())
-  result.content += textFilter.flush()
-  result.reasoning += reasoningFilter.flush()
+  message.content += textFilter.flush()
+  const trailingReasoning = reasoningFilter.flush()
+  if (trailingReasoning) message.reasoning_content = (message.reasoning_content ?? "") + trailingReasoning
   if (!sawFinish && !sawDone) {
     const error = new Error("Upstream stream ended before finish_reason or [DONE]")
     error.status = 502
     throw error
   }
 
-  const message = { role: "assistant", content: result.content }
-  if (result.reasoning) message.reasoning_content = result.reasoning
-  if (result.toolCalls.size > 0) {
-    const toolCalls = Array.from(result.toolCalls.values())
+  if (toolCalls.size > 0) {
+    const filteredToolCalls = Array.from(toolCalls.values())
       .sort((left, right) => left.index - right.index)
       .filter((call) => !(injectedRead && isReadToolCall(call)))
-    if (toolCalls.length > 0) {
-      message.tool_calls = toolCalls.map(({ index, ...call }) => call)
+    if (filteredToolCalls.length > 0) {
+      message.tool_calls = filteredToolCalls.map(({ index, ...call }) => call)
     }
   }
-  if (result.finishReason === "tool_calls" && !Array.isArray(message.tool_calls)) {
-    result.finishReason = "stop"
+  if (!message.content) {
+    const hasAlternateOutput =
+      message.reasoning_content ||
+      message.refusal ||
+      message.function_call ||
+      message.audio ||
+      message.annotations ||
+      Array.isArray(message.tool_calls)
+    message.content = hasAlternateOutput ? null : ""
   }
+  if (finishReason === "tool_calls" && !Array.isArray(message.tool_calls)) finishReason = "stop"
 
   return {
-    id: result.id || `chatcmpl-${randomBytes(12).toString("hex")}`,
+    ...metadata,
+    id: metadata.id || `chatcmpl-${randomBytes(12).toString("hex")}`,
     object: "chat.completion",
-    created: result.created || Math.floor(Date.now() / 1000),
-    model: result.model || "unknown",
-    choices: [{ index: 0, message, finish_reason: result.finishReason, logprobs: null }],
-    ...(result.usage ? { usage: result.usage } : {}),
+    created: metadata.created || Math.floor(Date.now() / 1000),
+    model: metadata.model || "unknown",
+    choices: [
+      {
+        ...choiceExtras,
+        index: 0,
+        message,
+        finish_reason: finishReason,
+        logprobs: Object.keys(logprobs).length > 0 ? logprobs : null,
+      },
+    ],
+    ...(usage ? { usage } : {}),
   }
 }
 
 function mergeToolCalls(target, calls) {
   for (const call of calls) {
     const index = call.index ?? 0
-    const existing = target.get(index) ?? {
-      index,
-      id: call.id ?? "",
-      type: call.type ?? "function",
-      function: { name: "", arguments: "" },
+    const existing = target.get(index) ?? { index }
+    for (const [key, value] of Object.entries(call)) {
+      if (key === "index") continue
+      if (key === "function" && value && typeof value === "object") {
+        existing.function ??= {}
+        for (const [functionKey, functionValue] of Object.entries(value)) {
+          if (
+            typeof functionValue === "string" &&
+            typeof existing.function[functionKey] === "string"
+          ) {
+            existing.function[functionKey] += functionValue
+          } else {
+            existing.function[functionKey] = functionValue
+          }
+        }
+        continue
+      }
+      if (key === "id" || key === "type") existing[key] = value
+      else if (value && typeof value === "object" && !Array.isArray(value)) {
+        existing[key] = { ...(existing[key] ?? {}), ...value }
+      }
+      else existing[key] = value
     }
-    if (call.id) existing.id = call.id
-    if (call.type) existing.type = call.type
-    if (call.function?.name) existing.function.name += call.function.name
-    if (call.function?.arguments) existing.function.arguments += call.function.arguments
     target.set(index, existing)
   }
 }
@@ -880,13 +972,32 @@ async function pipeChatStream(upstream, response, injectedRead = false, stats) {
   let error
   let sawFinish = false
   let sawDone = false
-  let emittedToolCalls = false
-  const bufferedToolCalls = new Map()
+  let backpressured = false
+  let toolSequence = 0
+  const emittedToolChoices = new Set()
+  const toolCallStates = new Map()
 
   const write = (value) => {
     if (response.writableEnded || response.destroyed) return
-    response.write(`data: ${JSON.stringify(value)}\n\n`)
+    if (!response.write(`data: ${JSON.stringify(value)}\n\n`)) backpressured = true
   }
+  const waitForDrain = () => {
+    if (!backpressured || response.writableEnded || response.destroyed) {
+      backpressured = false
+      return Promise.resolve()
+    }
+    return new Promise((resolve) => {
+      const finish = () => {
+        response.off("drain", finish)
+        response.off("close", finish)
+        backpressured = false
+        resolve()
+      }
+      response.once("drain", finish)
+      response.once("close", finish)
+    })
+  }
+  const chunkMeta = () => ({ ...meta, object: "chat.completion.chunk" })
   const flushFilters = () => {
     const delta = {}
     const text = textFilter.flush()
@@ -896,46 +1007,94 @@ async function pipeChatStream(upstream, response, injectedRead = false, stats) {
     if (Object.keys(delta).length === 0) return
     markOutput(stats)
     write({
-      id: meta.id,
-      object: "chat.completion.chunk",
-      created: meta.created,
-      model: meta.model,
+      ...chunkMeta(),
       choices: [{ index: 0, delta, finish_reason: null }],
     })
   }
-  const flushToolCalls = () => {
-    if (!injectedRead || bufferedToolCalls.size === 0) return
-    const toolCalls = Array.from(bufferedToolCalls.values())
-      .sort((left, right) => left.index - right.index)
-      .filter((call) => !isReadToolCall(call))
-    bufferedToolCalls.clear()
-    if (toolCalls.length === 0) return
-    emittedToolCalls = true
-    markOutput(stats)
-    write({
-      id: meta.id,
-      object: "chat.completion.chunk",
-      created: meta.created,
-      model: meta.model,
-      choices: [
-        {
-          index: 0,
-          delta: { tool_calls: toolCalls.map(({ index, ...call }) => ({ index, ...call })) },
-          finish_reason: null,
-        },
-      ],
-    })
+  const filterToolCalls = (choiceIndex, calls) => {
+    if (!injectedRead) {
+      emittedToolChoices.add(choiceIndex)
+      return calls
+    }
+    const output = []
+    for (const call of calls) {
+      const callIndex = call.index ?? 0
+      const key = `${choiceIndex}:${callIndex}`
+      const state = toolCallStates.get(key) ?? {
+        choiceIndex,
+        callIndex,
+        name: "",
+        mode: "pending",
+        buffer: [],
+      }
+      if (state.mode === "drop") continue
+      if (state.mode === "pass") {
+        output.push(call)
+        emittedToolChoices.add(choiceIndex)
+        continue
+      }
+      state.buffer.push({ sequence: toolSequence++, call })
+      if (typeof call.function?.name === "string") state.name += call.function.name
+      const name = state.name.trim().toLowerCase()
+      const hasArguments = typeof call.function?.arguments === "string" && call.function.arguments.length > 0
+      if (name === "read" && hasArguments) {
+        state.mode = "drop"
+        state.buffer = []
+        toolCallStates.set(key, state)
+        continue
+      }
+      if (!name || name === "read" || "read".startsWith(name)) {
+        toolCallStates.set(key, state)
+        continue
+      }
+      state.mode = "pass"
+      output.push(...state.buffer.map((entry) => entry.call))
+      state.buffer = []
+      emittedToolChoices.add(choiceIndex)
+      toolCallStates.set(key, state)
+    }
+    return output
+  }
+  const flushPendingToolCalls = (choiceIndexes) => {
+    const selectedStates = Array.from(toolCallStates.values()).filter(
+      (state) => state.mode === "pending" && (!choiceIndexes || choiceIndexes.has(state.choiceIndex)),
+    )
+    const pending = selectedStates
+      .filter((state) => state.name.trim().toLowerCase() !== "read")
+      .flatMap((state) => state.buffer.map((entry) => ({ ...entry, choiceIndex: state.choiceIndex })))
+      .sort((left, right) => left.sequence - right.sequence)
+    for (const state of selectedStates) {
+      if (state.name.trim().toLowerCase() === "read") {
+        state.mode = "drop"
+        state.buffer = []
+      } else {
+        state.mode = "pass"
+        state.buffer = []
+      }
+    }
+    if (pending.length === 0) return
+    const byChoice = new Map()
+    for (const entry of pending) {
+      const calls = byChoice.get(entry.choiceIndex) ?? []
+      calls.push(entry.call)
+      byChoice.set(entry.choiceIndex, calls)
+      emittedToolChoices.add(entry.choiceIndex)
+    }
+    for (const [choiceIndex, calls] of byChoice) {
+      markOutput(stats)
+      write({
+        ...chunkMeta(),
+        choices: [{ index: choiceIndex, delta: { tool_calls: calls }, finish_reason: null }],
+      })
+    }
   }
   const finishChunk = () => {
     if (!finishSent) {
-      const reason = injectedRead && finishReason === "tool_calls" && !emittedToolCalls
+      const reason = injectedRead && finishReason === "tool_calls" && !emittedToolChoices.has(0)
         ? "stop"
         : finishReason ?? "stop"
       write({
-        id: meta.id,
-        object: "chat.completion.chunk",
-        created: meta.created,
-        model: meta.model,
+        ...chunkMeta(),
         choices: [{ index: 0, delta: {}, finish_reason: reason }],
         ...(usage ? { usage } : {}),
       })
@@ -945,7 +1104,7 @@ async function pipeChatStream(upstream, response, injectedRead = false, stats) {
   const finishStream = () => {
     if (done) return
     flushFilters()
-    flushToolCalls()
+    flushPendingToolCalls()
     finishChunk()
     if (!response.writableEnded && !response.destroyed) response.write("data: [DONE]\n\n")
     done = true
@@ -968,16 +1127,19 @@ async function pipeChatStream(upstream, response, injectedRead = false, stats) {
       finishStream()
       return
     }
-    if (chunk.id) meta.id = chunk.id
-    if (chunk.created) meta.created = chunk.created
-    if (chunk.model) meta.model = chunk.model
-    const finishedChoice = (chunk.choices ?? []).find((choice) => choice?.finish_reason)
-    const hasFinish = finishedChoice !== undefined
+    for (const [key, value] of Object.entries(chunk)) {
+      if (["object", "choices", "usage"].includes(key)) continue
+      meta[key] = value
+    }
+    const finishedChoices = (chunk.choices ?? []).filter((choice) => choice?.finish_reason)
+    const hasFinish = finishedChoices.length > 0
+    const emittedToolCallsByChoice = new Map()
     let hasToolCalls = false
     let hasOutput = false
     for (const choice of chunk.choices ?? []) {
       const delta = choice?.delta
       if (!delta) continue
+      const choiceIndex = choice.index ?? 0
       if (typeof delta.content === "string") {
         const text = textFilter.push(delta.content)
         if (text) delta.content = text
@@ -991,32 +1153,47 @@ async function pipeChatStream(upstream, response, injectedRead = false, stats) {
         if (reasoning) hasOutput = true
       }
       if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
-        hasToolCalls = true
-        hasOutput = true
+        const filteredToolCalls = filterToolCalls(choiceIndex, delta.tool_calls)
         if (injectedRead) {
-          mergeToolCalls(bufferedToolCalls, delta.tool_calls)
           delete delta.tool_calls
-        }
+          if (filteredToolCalls.length > 0) emittedToolCallsByChoice.set(choiceIndex, filteredToolCalls)
+        } else if (filteredToolCalls.length > 0) delta.tool_calls = filteredToolCalls
+        else delete delta.tool_calls
+        hasToolCalls ||= filteredToolCalls.length > 0
+        hasOutput ||= filteredToolCalls.length > 0
       }
     }
     if (hasToolCalls) {
       flushFilters()
       textFilter.reset()
       reasoningFilter.reset()
+      for (const [choiceIndex, calls] of emittedToolCallsByChoice) {
+        markOutput(stats)
+        write({
+          ...chunkMeta(),
+          choices: [{ index: choiceIndex, delta: { tool_calls: calls }, finish_reason: null }],
+        })
+      }
     }
     if (hasFinish) {
       flushFilters()
-      finishReason = finishedChoice.finish_reason
+      finishReason = finishedChoices[0].finish_reason
       sawFinish = true
     }
     if (hasOutput) markOutput(stats)
     if (hasFinish) {
-      if (injectedRead) flushToolCalls()
-      else {
-        write(chunk)
-        finishSent = true
+      if (injectedRead) {
+        const finishedIndexes = new Set(finishedChoices.map((choice) => choice.index ?? 0))
+        flushPendingToolCalls(finishedIndexes)
+        for (const choice of finishedChoices) {
+          const choiceIndex = choice.index ?? 0
+          if (choice.finish_reason === "tool_calls" && !emittedToolChoices.has(choiceIndex)) {
+            choice.finish_reason = "stop"
+          }
+        }
       }
-      finishChunk()
+      write(chunk)
+      finishSent = true
       return
     }
     const hasDelta = (chunk.choices ?? []).some((choice) => {
@@ -1028,6 +1205,7 @@ async function pipeChatStream(upstream, response, injectedRead = false, stats) {
 
   try {
     while (reader && !done) {
+      await waitForDrain()
       const { done: finished, value } = await readStreamChunk(reader, STREAM_IDLE_TIMEOUT_MS)
       if (finished) break
       buffer += decoder.decode(value, { stream: true })
@@ -1053,6 +1231,7 @@ async function pipeChatStream(upstream, response, injectedRead = false, stats) {
     error = "Upstream stream ended before finish_reason or [DONE]"
   }
   if (!done) finishStream()
+  await waitForDrain()
   if (!response.writableEnded && !response.destroyed) response.end()
   return {
     usage,
@@ -1147,8 +1326,9 @@ function json(response, status, value) {
 function proxyError(error) {
   return {
     error: {
-      type: "proxy_error",
+      type: error?.code === "unsupported_parameter" ? "invalid_request_error" : "proxy_error",
       message: error instanceof Error ? error.message : String(error),
+      ...(error?.code ? { code: error.code } : {}),
     },
   }
 }

@@ -61,12 +61,13 @@ print(completion.choices[0].message.content)
 ## 行为
 
 - 自动补充 Zen 免费层要求的 OpenCode 兼容请求标记。
-- 支持标准 function tools；即使工具名称和参数分散在多个 SSE 分片中，也能保留有效的调用方工具调用。
+- 支持标准 function tools；即使工具名称和参数分散在多个 SSE 分片中，也能保留有效的调用方工具调用。非兼容标记的工具调用一旦能与注入的 `read` 区分，就会立即继续流式转发。
 - 多轮推理模型会将 assistant 的 `reasoning_content` 回放给上游。
 - 确定性地移除全部 user 历史开头的 `/think` 或 `/no_think`；只有最新 user 的标记会改变本次请求的推理强度。
-- 非流式客户端请求上游 SSE 时，自动聚合为标准 JSON Chat Completions 响应。
+- 非流式客户端请求上游 SSE 时，自动聚合为标准 JSON Chat Completions 响应，并保留 `system_fingerprint`、`service_tier`、choice `logprobs`、message `refusal`、`annotations` 等标准元数据。
 - 上游忽略 `stream: true` 并返回 JSON Chat Completion 时，会转换为合法 SSE；JSON 错误会明确返回，不再变成空流。
 - 流式响应始终以带 `finish_reason` 的终帧和 `[DONE]` 结束；上游提前 EOF 或发送 SSE error 时也能安全终止。非流式响应被截断时返回 `502`。
+- 流式写入支持背压，慢客户端不会导致代理进程无限缓存输出。
 - 按客户端会话派生稳定的上游 `ses_...` 会话 ID。
 - 日志包含时间、token 用量、TTFT、实际生成时间和输出速度。
 
@@ -107,6 +108,7 @@ npm start
 ## 限制
 
 - 仅支持 Chat Completions。Embeddings、图片生成、音频、Responses API 与 Anthropic Messages 均未实现。
+- 当前只支持单个 choice。`n != 1`、`logprobs` 或 `top_logprobs` 会明确返回 `400 unsupported_parameter`，不会静默降级。
 - 上游免费层检查属于启发式客户端指纹，可能随时变化。
 - 代理会注入一个最小的 `read` 工具标记。调用方未提供工具时强制设置 `tool_choice: "none"`；提供工具时会加入系统提示，要求模型不要调用该标记。上游返回的 `read` 调用会按完整工具调用移除，不会泄漏跨分片的孤立参数。
 - 默认只监听回环地址；除非增加认证层，否则不要公开暴露。
